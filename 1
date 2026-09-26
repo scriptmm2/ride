@@ -4493,6 +4493,8 @@ local VirtualUser = game:GetService("VirtualUser")
 local Farm = {
     Alive = true,
     Enabled = false,
+    TeleportFarmEnabled = false,
+    TeleportRejectedUntil = 0,
     AutoPlaceEnabled = false,
     AutoHatchBestEnabled = false,
     AutoBestEnabled = false,
@@ -4508,6 +4510,9 @@ local Farm = {
         TPHeightOffset = 3,
         FlyHeight = 12,
         MovementSpeed = 300,
+        TeleportConfirmDelay = 0.25,
+        TeleportCorrectionRadius = 14,
+        TeleportRetryDelay = 10,
         AutoFarmHoldTime = 8,
         RanchLoopDelay = 0.65,
         PlaceDelay = 0.45,
@@ -4923,6 +4928,98 @@ local function moveToPosition(position, target)
     return Farm.Enabled
 end
 
+local function teleportToTarget(target)
+    local root = getRoot()
+    local targetCFrame = getTargetCFrame(target)
+    if not Farm.Alive or not Farm.Enabled or not root or not targetCFrame then
+        return false
+    end
+
+    local arrival = targetCFrame + Vector3.new(0, Farm.Config.TPHeightOffset, 0)
+    ensurePlatform(arrival - Vector3.new(0, 3.5, 0))
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.CFrame = arrival
+
+    -- Wait for the server's position replication before attempting the pickup.
+    task.wait(Farm.Config.TeleportConfirmDelay)
+    root = getRoot()
+    if not Farm.Enabled or not target.Parent or not root then
+        return false
+    end
+
+    if (root.Position - arrival.Position).Magnitude > Farm.Config.TeleportCorrectionRadius then
+        Farm.TeleportRejectedUntil = os.clock() + Farm.Config.TeleportRetryDelay
+        setFarmStatus("Teleport corrected; using smooth movement temporarily")
+        clearPlatform()
+        return false
+    end
+
+    return true
+end
+
+local function dumpClientAntiCheatCandidates()
+    if type(writefile) ~= "function" then
+        return false, "Executor file writing is unavailable"
+    end
+
+    local roots = {
+        LocalPlayer:FindFirstChild("PlayerScripts"),
+        PlayerGui,
+        ReplicatedStorage,
+        LocalPlayer.Character,
+    }
+    local markers = { "anti", "cheat", "security", "exploit", "teleport", "movement", "speed" }
+    local seen = {}
+    local scripts = {}
+
+    for _, root in pairs(roots) do
+        if root then
+            for _, item in ipairs(root:GetDescendants()) do
+                if (item:IsA("LocalScript") or item:IsA("ModuleScript")) and not seen[item] then
+                    seen[item] = true
+                    local path = item:GetFullName()
+                    local normalizedPath = lowerText(path)
+                    local candidate = false
+                    for _, marker in ipairs(markers) do
+                        if string.find(normalizedPath, marker, 1, true) then
+                            candidate = true
+                            break
+                        end
+                    end
+                    table.insert(scripts, { Object = item, Path = path, Candidate = candidate })
+                end
+            end
+        end
+    end
+
+    table.sort(scripts, function(a, b) return a.Path < b.Path end)
+    local lines = { "Crystal Hub client script inventory / anti-cheat candidates" }
+    local candidateCount = 0
+    for _, entry in ipairs(scripts) do
+        table.insert(lines, (entry.Candidate and "CANDIDATE " or "INDEX ") .. entry.Path)
+        if entry.Candidate then
+            candidateCount = candidateCount + 1
+            if type(decompile) == "function" then
+                local ok, source = pcall(decompile, entry.Object)
+                table.insert(lines, ok and type(source) == "string"
+                    and string.sub(source, 1, 250000)
+                    or "[decompile unavailable for this script]")
+            else
+                table.insert(lines, "[decompile API unavailable]")
+            end
+            table.insert(lines, "---")
+        end
+    end
+
+    local outputPath = "CrystalHub_AC_dump.txt"
+    local ok, err = pcall(writefile, outputPath, table.concat(lines, "\n"))
+    if not ok then
+        return false, tostring(err)
+    end
+    return true, string.format("%s (%d candidates / %d scripts)", outputPath, candidateCount, #scripts)
+end
+
 local function interactWithTarget(target, holdTime)
     if not target or not target.Parent then
         return false
@@ -5015,7 +5112,7 @@ local function getOwnedPlot()
     return nil
 end
 
-local function returnToPlot()
+local function returnToPlot(directTeleport)
     local plot = getOwnedPlot()
     if not plot then
         clearPlatform()
@@ -5030,16 +5127,29 @@ local function returnToPlot()
         return false
     end
 
-    if Farm.Enabled then
+    if Farm.Enabled and not directTeleport then
         moveToPosition(plotCFrame.Position, nil)
     end
 
     local root = getRoot()
     if root then
-        root.CFrame = plotCFrame + Vector3.new(0, 3, 0)
+        local arrival = plotCFrame + Vector3.new(0, 3, 0)
+        root.CFrame = arrival
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         root.Anchored = false
+
+        if directTeleport then
+            task.wait(Farm.Config.TeleportConfirmDelay)
+            root = getRoot()
+            if root and (root.Position - arrival.Position).Magnitude > Farm.Config.TeleportCorrectionRadius then
+                Farm.TeleportRejectedUntil = os.clock() + Farm.Config.TeleportRetryDelay
+                setFarmStatus("Plot teleport corrected; using smooth movement temporarily")
+                if Farm.Enabled then
+                    moveToPosition(plotCFrame.Position, nil)
+                end
+            end
+        end
     end
 
     clearPlatform()
@@ -7802,14 +7912,26 @@ task.spawn(function()
 
                     local targetCFrame = getTargetCFrame(target)
                     if targetCFrame then
-                        local reached = moveToPosition(targetCFrame.Position, target)
+                        local useTeleport = Farm.TeleportFarmEnabled
+                            and os.clock() >= Farm.TeleportRejectedUntil
+                        local reached
+                        if useTeleport then
+                            reached = teleportToTarget(target)
+                        else
+                            reached = moveToPosition(targetCFrame.Position, target)
+                        end
+
+                        if useTeleport and not reached and Farm.Enabled and target.Parent then
+                            useTeleport = false
+                            reached = moveToPosition(targetCFrame.Position, target)
+                        end
 
                         if Farm.Enabled and reached and target.Parent then
                             interactWithTarget(target, Farm.Config.AutoFarmHoldTime)
 
                             if Farm.Enabled then
                                 setFarmStatus("Dropping off...")
-                                returnToPlot()
+                                returnToPlot(useTeleport)
                                 task.wait(0.5)
                             end
                         end
@@ -7831,6 +7953,8 @@ end)
 
 function Library:StopFeatures()
     Farm.Enabled = false
+    Farm.TeleportFarmEnabled = false
+    Farm.TeleportRejectedUntil = 0
     Farm.AutoPlaceEnabled = false
     Farm.AutoHatchBestEnabled = false
     Farm.AutomationBusy = false
@@ -7922,6 +8046,7 @@ local UI = {
     SpawnedCountLabel = nil,
     SpawnedListLabel = nil,
     AutoFarmToggle = nil,
+    TeleportFarmToggle = nil,
     AutoPlaceToggle = nil,
     AutoHatchBestToggle = nil,
     EggToggles = {},
@@ -7988,6 +8113,34 @@ local function buildInterface()
             Kind = enabled and "success" or "info",
         })
     end, "farm_enabled")
+
+    UI.TeleportFarmToggle = farmSection:AddToggle("Steal Eggs by Teleport", false, function(enabled)
+        Farm.TeleportFarmEnabled = enabled and true or false
+        Farm.TeleportRejectedUntil = 0
+        setFarmStatus(enabled and "Teleport egg farm selected" or "Smooth egg farm selected")
+        refreshInfoLabels()
+
+        Window:Notify({
+            Title = "Crystal Hub",
+            Text = enabled
+                and "Egg farming will teleport to targets and directly return to your plot."
+                or "Egg farming will use smooth movement.",
+            Duration = 3,
+            Kind = "info",
+        })
+    end, "farm_teleport_eggs")
+
+    farmSection:AddButton("Dump Client AC Candidates", function()
+        task.spawn(function()
+            local ok, result = dumpClientAntiCheatCandidates()
+            Window:Notify({
+                Title = "Crystal Hub",
+                Text = ok and ("Client dump saved: " .. result) or ("Client dump failed: " .. result),
+                Duration = 6,
+                Kind = ok and "success" or "warning",
+            })
+        end)
+    end, "farm_dump_client_ac")
 
     farmSection:AddButton("Return to My Plot", function()
         local previous = Farm.Enabled
