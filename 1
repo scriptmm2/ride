@@ -1,3 +1,5 @@
+
+
 --[[
     ========================================================================
       Crystal Hub — Ride a Pet Automation (English build)
@@ -5233,7 +5235,7 @@ local function teleportToTarget(target, eggPosition)
     return true
 end
 
--- Chilli Hub's three-leg cruise pattern, with collision restoration and a
+-- Crystal Hub's three-leg cruise pattern, with collision restoration and a
 -- bounded flight so a corrected position cannot trap the farm loop forever.
 function Farm.flyTo(goal, shouldStop, arrivalRadius, useNoclip)
     local root = getRoot()
@@ -8408,7 +8410,7 @@ end
 
 task.spawn(function()
     while Farm.Alive do
-        if Farm.AutoHatchBestEnabled and not Farm.AutomationBusy then
+        if Farm.AutoHatchBestEnabled and not Farm.AutomationBusy and not Farm.Enabled then
             Farm.AutomationBusy = true
 
             local ok, success, message = pcall(hatchReadyEggsAndPlaceBest)
@@ -8433,7 +8435,7 @@ task.spawn(function()
     local lastSignature = ""
 
     while Farm.Alive do
-        if Farm.AutoBestEnabled and not Farm.AutomationBusy then
+        if Farm.AutoBestEnabled and not Farm.AutomationBusy and not Farm.Enabled then
             local currentSignature = getPetInventorySignature()
 
             if currentSignature ~= lastSignature then
@@ -8462,7 +8464,7 @@ end)
 
 task.spawn(function()
     while Farm.Alive do
-        if Farm.AutoPlaceEnabled and not Farm.AutomationBusy then
+        if Farm.AutoPlaceEnabled and not Farm.AutomationBusy and not Farm.Enabled then
             Farm.AutomationBusy = true
 
             local plot = getOwnedPlot()
@@ -8732,26 +8734,7 @@ function Farm.feedOnePet()
     setFarmStatus(confirmed and "Auto Feed: pet fed" or "Auto Feed: no confirmation")
 end
 
-function Farm.setAutoFarm(enabled)
-    Farm.Enabled = enabled and true or false
-    if Farm.arcSetFarmNoclip then
-        Farm.arcSetFarmNoclip(Farm.Enabled and Farm.Chilli.FarmNoclip)
-    end
-
-    if Farm.Enabled then
-        setFarmStatus("RideAPet instant auto collect enabled")
-    else
-        setFarmStatus("Stopped")
-        clearPlatform()
-
-        local root = getRoot()
-        if root then
-            root.Anchored = false
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end
-    end
-end
+-- Farm.setAutoFarm is defined by the Crystal egg engine below.
 
 function Farm.buildSpawnedSummary()
     local folder = Farm.RenderedEggs
@@ -8828,706 +8811,1791 @@ trackFarmConnection(LocalPlayer.Idled:Connect(function()
     end)
 end))
 
--- Chilli Hub auto-collect engine.  This is deliberately separate from the old
--- RenderedEggs/prompt/teleport route: it plans from ServerData.ActiveEggs,
--- picks up by EggPickup, optionally relays near the plot, and confirms
--- delivery by observing Basket rather than assuming proximity means success.
-Farm.Chilli = {
-    Manual = {}, Carried = {}, RejectedUntil = {}, Target = nil,
-    Dropped = nil, LastPickupAt = 0, PickupPos = nil, Relaying = false,
-    MinRank = 0, Priority = "Best Value", ReserveSeconds = 3,
-    UseRelay = false, DepositedCount = 0,
-    VolcanicLairPath = true, LairSettle = 0.8, PickupRetries = 8,
-    UsePrompt = false, FarmNoclip = true, NoclipActive = false,
-    LastPickup = { Mode = nil, Reason = nil, Name = nil },
-    CollisionBackup = setmetatable({}, { __mode = "k" }),
-    LastPlacedPos = nil, LastPlacedAt = 0, ManualUntil = 0,
-}
+--======================================================================--
+--  CRYSTAL HUB — DIRECT RIDE A PET EGG ENGINE
+--  Theft path is kept source-style; only the surrounding UI is Crystal Hub.
+--======================================================================--
 
--- RideAPet-style character pivot, with server-confirmed pickup and arrival
--- claim below. Keep the existing Crystal Hub target planner and UI.
-function Farm.chilliPivotTo(cframe)
-    local character, root = getCharacter(), getRoot()
-    if not character or not root or typeof(cframe) ~= "CFrame" then
-        return false
-    end
-    clearPlatform()
-    root.Anchored = false
-    local ok = pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        character:PivotTo(cframe)
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end)
-    if ok then
-        Farm.Chilli.LastPlacedPos = cframe.Position
-        Farm.Chilli.LastPlacedAt = os.clock()
-    end
-    return ok
-end
+Farm.CrystalEgg = {}
 
-function Farm.chilliEggTopCFrame(eggPosition)
-    local rendered = Workspace:FindFirstChild("RenderedEggs")
-    local nearest, nearestDistance = nil, 12
-    if rendered then
+Farm.InitializeCrystalEggEngine = function()
+    local HUB = {
+        dead = false,
+        conns = {},
+        lastPlacedPos = nil,
+        lastPlacedAt = nil,
+        manualUntil = nil,
+        manualWarnAt = nil,
+        lastSideAt = nil,
+        loopsRunning = false,
+    }
+
+    local Players = game:GetService("Players")
+    local RS = game:GetService("ReplicatedStorage")
+    local Workspace = game:GetService("Workspace")
+    local RunService = game:GetService("RunService")
+    local UserInputService = game:GetService("UserInputService")
+
+    local LP = Players.LocalPlayer
+
+    local function track(conn)
+        table.insert(HUB.conns, conn)
+        return conn
+    end
+
+    local function GetHRP()
+        local char = LP.Character
+        return char and char:FindFirstChild("HumanoidRootPart")
+    end
+
+    local function GetHumanoid()
+        local char = LP.Character
+        return char and char:FindFirstChildOfClass("Humanoid")
+    end
+
+    -- Exact source-style remote resolution.
+    local Remotes = RS:WaitForChild("Remotes", 30)
+    local GameRemotes = Remotes and Remotes:WaitForChild("Game", 30)
+
+    local function Remote(name)
+        if not GameRemotes then
+            return nil
+        end
+        return GameRemotes:FindFirstChild(name)
+    end
+
+    local function SafeRequire(inst)
+        if not inst then
+            return nil
+        end
+        local ok, res = pcall(require, inst)
+        if ok and type(res) == "table" then
+            return res
+        end
+        return nil
+    end
+
+    local GameData = RS:FindFirstChild("GameData")
+    local GameServices = RS:FindFirstChild("GameServices")
+    local EggData = SafeRequire(GameData and GameData:FindFirstChild("Eggs"))
+    local GeneralData = SafeRequire(GameData and GameData:FindFirstChild("General"))
+    local DayNightSvc = SafeRequire(GameServices and GameServices:FindFirstChild("DayNight"))
+
+    local RARITY_ORDER = {
+        Common = 1,
+        Rare = 2,
+        Epic = 3,
+        Legendary = 4,
+        Mythic = 5,
+        Ethereal = 6,
+        Divine = 7,
+        Volcanic = 8,
+    }
+
+    local S = {
+        eggLoop = false,
+        eggPriority = "Best Value",
+        eggRarities = {},
+        eggLoopDelay = 0,
+        sideInterval = 3,
+        autoDeliver = true,
+        autoPlant = false,
+        plantMinLuck = 0,
+        autoHatch = true,
+        hatchDelay = 1.0,
+        maxEggTravel = 0,
+        volcanicLairPath = true,
+        lairSettle = 0.8,
+        pickupRetries = 8,
+        deliverDelay = 0,
+        useRemotes = true,
+        usePrompt = false,
+        farmNoclip = true,
+        farmNoclipActive = false,
+        busy = false,
+        lastEggError = nil,
+        stats = {
+            eggs = 0,
+            hatched = 0,
+            delivered = 0,
+            planted = 0,
+            cash = 0,
+        },
+    }
+
+    Farm.CrystalEgg.State = S
+
+    local function Notify(_, content)
+        setFarmStatus(tostring(content or ""))
+    end
+
+    local function EggInfo(name)
+        if EggData and EggData[name] then
+            return EggData[name]
+        end
+        return nil
+    end
+
+    local function RarityRank(rarity)
+        return RARITY_ORDER[rarity] or 0
+    end
+
+    -- Kept source-style instead of using Crystal Hub's older plot helper.
+    local function OwnPlot()
+        local plots = Workspace:FindFirstChild("Plots")
+        if not plots then
+            return nil
+        end
+
+        for _, p in ipairs(plots:GetChildren()) do
+            if p:GetAttribute("NestsOwnerLoaded") == LP.UserId then
+                return p
+            end
+        end
+
+        for _, p in ipairs(plots:GetChildren()) do
+            local data = p:FindFirstChild("Data")
+            local owner = data and data:FindFirstChild("Owner")
+            if owner and owner:IsA("ObjectValue") and owner.Value == LP then
+                return p
+            end
+        end
+
+        return nil
+    end
+
+    local function PlotEggs(plot)
+        return plot and plot:FindFirstChild("Eggs")
+    end
+
+    local function PlotNests(plot)
+        return plot and plot:FindFirstChild("Nests")
+    end
+
+    local function Basket()
+        return LP:FindFirstChild("Basket")
+    end
+
+    local function CarriedEggs()
+        local b = Basket()
+        return b and b:GetChildren() or {}
+    end
+
+    -- Hard character TP used by the working source.
+    local function PivotCharacter(cframe)
+        if typeof(cframe) ~= "CFrame" then
+            return false
+        end
+
+        local char = LP.Character
+        local hrp = GetHRP()
+
+        if not char or not hrp then
+            return false
+        end
+
+        local ok = pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            char:PivotTo(cframe)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        if ok then
+            HUB.lastPlacedPos = cframe.Position
+            HUB.lastPlacedAt = os.clock()
+        end
+
+        return ok
+    end
+
+    local EGG_HEIGHT_OFFSET = 10
+
+    local function EggTopCFrame(model)
+        if not model or not model.Parent then
+            return nil
+        end
+
+        local ok, bb, size = pcall(function()
+            return model:GetBoundingBox()
+        end)
+
+        if not ok or typeof(bb) ~= "CFrame" or typeof(size) ~= "Vector3" then
+            return nil
+        end
+
+        return CFrame.new(Vector3.new(
+            bb.Position.X,
+            bb.Position.Y + size.Y * 0.5 + EGG_HEIGHT_OFFSET,
+            bb.Position.Z
+        ))
+    end
+
+    local function PartTopCFrame(part)
+        if not part or not part:IsA("BasePart") or not part.Parent then
+            return nil
+        end
+
+        return part.CFrame * CFrame.new(
+            0,
+            part.Size.Y * 0.5 + EGG_HEIGHT_OFFSET,
+            0
+        )
+    end
+
+    local function TravelToCFrame(cframe)
+        if typeof(cframe) ~= "CFrame" then
+            return false
+        end
+        return PivotCharacter(cframe)
+    end
+
+    local function TravelTo(pos, yOffset)
+        if typeof(pos) ~= "Vector3" then
+            return false
+        end
+        return TravelToCFrame(
+            CFrame.new(pos + Vector3.new(0, yOffset or 3, 0))
+        )
+    end
+
+    local function PlayerCash()
+        local sd = LP:FindFirstChild("SavedData")
+        local cash = sd and sd:FindFirstChild("Cash")
+        return cash and cash.Value or 0
+    end
+
+    local lastHold = {
+        duration = nil,
+        method = nil,
+        action = nil,
+    }
+
+    local PROMPT_SETTLE = 0.05
+
+    local function FirePrompt(prompt)
+        if not prompt
+            or not prompt:IsA("ProximityPrompt")
+            or not prompt.Parent then
+            return false
+        end
+
+        if prompt.Enabled == false then
+            return false
+        end
+
+        lastHold.duration = tonumber(prompt.HoldDuration) or 0
+        lastHold.action = tostring(prompt.ActionText or "")
+
+        local ok = false
+        if type(fireproximityprompt) == "function" then
+            ok = pcall(fireproximityprompt, prompt)
+        end
+
+        lastHold.method = ok
+            and "Proximity prompt"
+            or "prompt trigger failed"
+
+        return ok
+    end
+
+    local function ServerDataFolder()
+        return RS:FindFirstChild("ServerData")
+    end
+
+    local function ActiveEggsFolder()
+        local sd = ServerDataFolder()
+        return sd and sd:FindFirstChild("ActiveEggs")
+    end
+
+    local function EggPickupRemote()
+        return Remote("EggPickup")
+    end
+
+    local function EggPlacedRemote()
+        return Remote("EggPlaced")
+    end
+
+    local function ArrivalClaimRemote()
+        return Remote("EggArrivalClaim")
+    end
+
+    -- IMPORTANT: exactly like the working source, this listener only stores
+    -- the latest server reply. It does NOT turn intermediate Refused replies
+    -- into a user-facing/final failure.
+    local lastPickup = {
+        mode = nil,
+        reason = nil,
+        name = nil,
+    }
+
+    if EggPickupRemote() then
+        track(EggPickupRemote().OnClientEvent:Connect(function(mode, reason, name)
+            lastPickup = {
+                mode = tostring(mode),
+                reason = tostring(reason),
+                name = tostring(name),
+            }
+        end))
+    end
+
+    local function EggRecords()
+        local out = {}
+        local folder = ActiveEggsFolder()
+
+        if not folder then
+            return out
+        end
+
+        local now = Workspace:GetServerTimeNow()
+
+        for _, record in ipairs(folder:GetChildren()) do
+            local name = record:GetAttribute("Egg")
+            local pos = record:GetAttribute("Position")
+            local private = record:GetAttribute("PrivateTo")
+            local dropEnds = tonumber(record:GetAttribute("DropEndsAt"))
+            local falling =
+                dropEnds ~= nil
+                and dropEnds == dropEnds
+                and dropEnds > now
+
+            if type(name) == "string"
+                and typeof(pos) == "Vector3"
+                and (private == nil or private == LP.UserId)
+                and not falling then
+
+                local info = EggInfo(name)
+
+                out[#out + 1] = {
+                    record = record,
+                    id = record.Name,
+                    name = name,
+                    pos = pos,
+                    weight = tonumber(record:GetAttribute("Weight")) or 1,
+                    mutation = record:GetAttribute("Mutation"),
+                    rarity = (info and info.Rarity) or "?",
+                    luck = (info and info.Luck) or 0,
+                    sell = (info and info.SellPrice) or 0,
+                    growth = (info and info.GrowthTime) or 0,
+                }
+            end
+        end
+
+        return out
+    end
+
+    local function RenderedEggs()
+        local out = {}
+        local rendered = Workspace:FindFirstChild("RenderedEggs")
+
+        if not rendered then
+            return out
+        end
+
         for _, model in ipairs(rendered:GetChildren()) do
             if model:IsA("Model") then
-                local ok, box, size = pcall(function()
-                    return model:GetBoundingBox()
+                local pp =
+                    model.PrimaryPart
+                    or model:FindFirstChildWhichIsA("BasePart", true)
+
+                if pp then
+                    local info = EggInfo(model.Name)
+                    local prompt = model:FindFirstChild("Pickup", true)
+
+                    if not prompt or not prompt:IsA("ProximityPrompt") then
+                        prompt =
+                            model:FindFirstChildWhichIsA(
+                                "ProximityPrompt",
+                                true
+                            )
+                    end
+
+                    out[#out + 1] = {
+                        model = model,
+                        pos = pp.Position,
+                        rarity = (info and info.Rarity) or "?",
+                        prompt =
+                            (prompt and prompt:IsA("ProximityPrompt"))
+                            and prompt
+                            or nil,
+                    }
+                end
+            end
+        end
+
+        return out
+    end
+
+    local function RenderedEggNear(pos)
+        if typeof(pos) ~= "Vector3" then
+            return nil
+        end
+
+        local best
+        local bestD
+
+        for _, r in ipairs(RenderedEggs()) do
+            local d = (r.pos - pos).Magnitude
+
+            if d < 12 and (not bestD or d < bestD) then
+                best = r
+                bestD = d
+            end
+        end
+
+        return best
+    end
+
+    local function TravelToEgg(egg)
+        if not egg or typeof(egg.pos) ~= "Vector3" then
+            return false
+        end
+
+        local rendered = RenderedEggNear(egg.pos)
+        local target =
+            rendered
+            and EggTopCFrame(rendered.model)
+
+        if not target then
+            target =
+                CFrame.new(
+                    egg.pos
+                    + Vector3.new(
+                        0,
+                        EGG_HEIGHT_OFFSET,
+                        0
+                    )
+                )
+        end
+
+        return TravelToCFrame(target)
+    end
+
+    local VOLCANIC_EGG = "Volcanic Egg"
+
+    local function IsVolcanicEgg(egg)
+        if not egg then
+            return false
+        end
+
+        if egg.name == VOLCANIC_EGG then
+            return true
+        end
+
+        local rec = egg.record
+        if not rec then
+            return false
+        end
+
+        local ok, val =
+            pcall(function()
+                return rec:GetAttribute("Egg")
+            end)
+
+        return ok and val == VOLCANIC_EGG
+    end
+
+    local function LairDoor()
+        local vol = Workspace:FindFirstChild("Volcano")
+        if not vol then
+            return nil
+        end
+
+        local p = vol:FindFirstChild("VolcanoEntrance")
+        if p and p:IsA("BasePart") then
+            return p
+        end
+
+        for _, c in ipairs(vol:GetChildren()) do
+            if c:IsA("BasePart")
+                and string.find(
+                    string.lower(c.Name),
+                    "entrance",
+                    1,
+                    true
+                ) then
+                return c
+            end
+        end
+
+        return nil
+    end
+
+    local function LairBounds()
+        local b = Workspace:FindFirstChild("GuardianBounds")
+        if b and b:IsA("BasePart") then
+            return b
+        end
+        return nil
+    end
+
+    local function InBox(part, pos)
+        if not (part and typeof(pos) == "Vector3") then
+            return false
+        end
+
+        local ok, res = pcall(function()
+            local v = part.CFrame:PointToObjectSpace(pos)
+            local h = part.Size * 0.5
+            return math.abs(v.X) <= h.X
+                and math.abs(v.Y) <= h.Y
+                and math.abs(v.Z) <= h.Z
+        end)
+
+        return ok and res == true
+    end
+
+    local function ServerSeesInsideLair()
+        local ok, val =
+            pcall(function()
+                return LP:GetAttribute("InVolcano")
+            end)
+
+        return ok and val == true
+    end
+
+    local function InsideLair()
+        local hrp = GetHRP()
+        local b = LairBounds()
+
+        if hrp and b and InBox(b, hrp.Position) then
+            return true
+        end
+
+        return ServerSeesInsideLair()
+    end
+
+    local function EnterLair()
+        if ServerSeesInsideLair() then
+            return true
+        end
+
+        local door = LairDoor()
+
+        for _ = 1, 3 do
+            if HUB.dead then
+                return false
+            end
+
+            if door then
+                local look = door.CFrame.LookVector
+
+                for _, step in ipairs({ -7, 0, 7, 0 }) do
+                    TravelToCFrame(
+                        CFrame.new(
+                            door.Position
+                            + look * step
+                            + Vector3.new(0, 2, 0)
+                        )
+                    )
+                    task.wait(0.12)
+                end
+            end
+
+            local waited = 0
+
+            while waited < (tonumber(S.lairSettle) or 0.6) do
+                if ServerSeesInsideLair() then
+                    return true
+                end
+
+                task.wait(0.05)
+                waited = waited + 0.05
+            end
+        end
+
+        return ServerSeesInsideLair() or InsideLair()
+    end
+
+    local function AimCameraAtEgg(rendered)
+        local prompt = rendered and rendered.prompt
+        local part = prompt and prompt.Parent
+
+        if not part or not part:IsA("BasePart") then
+            return false
+        end
+
+        local needs = prompt.RequiresLineOfSight == true
+
+        pcall(function()
+            if not needs
+                and part:HasTag("EggPickupRequiresLineOfSight") then
+                needs = true
+            end
+        end)
+
+        if not needs then
+            return false
+        end
+
+        local cam = Workspace.CurrentCamera
+        if not cam then
+            return false
+        end
+
+        pcall(function()
+            cam.CFrame =
+                CFrame.lookAt(
+                    cam.CFrame.Position,
+                    part.Position
+                )
+        end)
+
+        return true
+    end
+
+    local function RarityAllowed(rarity)
+        if not S.eggRarities
+            or next(S.eggRarities) == nil then
+            return true
+        end
+
+        return S.eggRarities[rarity] == true
+    end
+
+    -- Crystal egg-type filter. This affects ONLY which target is selected;
+    -- the working pickup/teleport/retry/delivery path below is untouched.
+    -- No selected egg types = allow all, matching the UI label.
+    local function EggTypeAllowed(name)
+        if Farm.selectedCount() <= 0 then
+            return true
+        end
+
+        name = tostring(name or "")
+
+        -- Exact game/UI name first.
+        if Farm.Selected[name] == true then
+            return true
+        end
+
+        -- Existing Crystal aliases (e.g. Volcanic Egg -> Volcano Egg).
+        local canonical = normalizeEggName(name)
+        if Farm.Selected[canonical] == true then
+            return true
+        end
+
+        -- Spacing-insensitive fallback fixes Black Hole Egg / Blackhole Egg
+        -- without changing either name in the existing UI.
+        local compact = string.lower((name:gsub("%s+", "")))
+
+        for selectedName, enabled in pairs(Farm.Selected) do
+            if enabled == true
+                and string.lower((tostring(selectedName):gsub("%s+", ""))) == compact then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    -- Exact source priority logic: Fast Cycle | Best Value | Nearest.
+    local function PickTargetEgg()
+        local hrp = GetHRP()
+        if not hrp then
+            return nil
+        end
+
+        local origin = hrp.Position
+        local renderedList = RenderedEggs()
+
+        local function Claimable(egg)
+            for _, r in ipairs(renderedList) do
+                if (r.pos - egg.pos).Magnitude < 8
+                    and r.prompt
+                    and r.prompt.Parent then
+                    return true
+                end
+            end
+            return false
+        end
+
+        local best
+        local bestScore
+        local bestClaimable = false
+
+        for _, egg in ipairs(EggRecords()) do
+            if RarityAllowed(egg.rarity)
+                and EggTypeAllowed(egg.name) then
+                local travel =
+                    (
+                        (egg.pos - origin)
+                        * Vector3.new(1, 0, 1)
+                    ).Magnitude
+
+                local maxTravel = 0
+
+                if maxTravel <= 0
+                    or travel <= maxTravel then
+
+                    local claimable =
+                        S.usePrompt
+                        and Claimable(egg)
+                        or false
+
+                    local value =
+                        RarityRank(egg.rarity) * 1000
+                        + egg.luck
+                        + egg.sell * 10
+
+                    local score
+
+                    if S.eggPriority == "Nearest" then
+                        score = -travel
+                    elseif S.eggPriority == "Fast Cycle" then
+                        score =
+                            value
+                            / math.max(
+                                (travel / 200)
+                                + egg.growth
+                                + 2,
+                                1
+                            )
+                    else
+                        score = value - travel * 0.1
+                    end
+
+                    if claimable and not bestClaimable then
+                        best = egg
+                        bestScore = score
+                        bestClaimable = true
+                    elseif claimable == bestClaimable
+                        and (
+                            not bestScore
+                            or score > bestScore
+                        ) then
+                        best = egg
+                        bestScore = score
+                    end
+                end
+            end
+        end
+
+        return best
+    end
+
+    -- This is the source-style pickup path. Do not add sync waits here.
+    local function CollectEgg(egg, tries)
+        if not egg or HUB.dead then
+            return false, "no target"
+        end
+
+        if #CarriedEggs() > 0 then
+            return false, "carry full"
+        end
+
+        local before = #CarriedEggs()
+
+        local volcanic = IsVolcanicEgg(egg)
+
+        if volcanic
+            and S.volcanicLairPath ~= false
+            and not ServerSeesInsideLair() then
+            EnterLair()
+        end
+
+        lastPickup = {
+            mode = nil,
+            reason = nil,
+            name = egg.name,
+            hold = nil,
+            method = nil,
+        }
+
+        local function WaitBasket(seconds)
+            local waited = 0
+
+            while waited < seconds
+                and #CarriedEggs() == before do
+                task.wait(0.02)
+                waited = waited + 0.02
+            end
+
+            return #CarriedEggs() > before
+        end
+
+        local remote = EggPickupRemote()
+
+        local function Claim()
+            if remote then
+                pcall(function()
+                    remote:FireServer(egg.id)
                 end)
-                if ok and typeof(box) == "CFrame" and typeof(size) == "Vector3" then
-                    local distance = (box.Position - eggPosition).Magnitude
-                    if distance < nearestDistance then
-                        nearest, nearestDistance = Vector3.new(
-                            box.Position.X, box.Position.Y + size.Y / 2 + 10, box.Position.Z
-                        ), distance
+                lastPickup.method = "Remote (instant)"
+            end
+
+            if S.usePrompt then
+                local r = RenderedEggNear(egg.pos)
+                local p = r and r.prompt
+
+                if p and p.Parent then
+                    AimCameraAtEgg(r)
+                    FirePrompt(p)
+                    lastPickup.hold = lastHold.duration
+
+                    if not lastPickup.method then
+                        lastPickup.method = lastHold.method
                     end
                 end
             end
         end
-    end
-    return CFrame.new(nearest or (eggPosition + Vector3.new(0, 10, 0)))
-end
 
--- ARC RideAPet egg-loop helpers, adapted to Crystal Hub's existing state/UI.
-function Farm.arcRenderedEggNear(eggPosition)
-    local rendered = Workspace:FindFirstChild("RenderedEggs")
-    local best, nearest = nil, 12
-    if rendered then
-        for _, model in ipairs(rendered:GetChildren()) do
-            if model:IsA("Model") then
-                local ok, box, size = pcall(function() return model:GetBoundingBox() end)
-                if ok and typeof(box) == "CFrame" and typeof(size) == "Vector3" then
-                    local distance = (box.Position - eggPosition).Magnitude
-                    if distance < nearest then
-                        local prompt = model:FindFirstChild("Pickup", true)
-                        if not prompt or not prompt:IsA("ProximityPrompt") then
-                            prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
-                        end
-                        best, nearest = {
-                            Model = model,
-                            Prompt = prompt and prompt:IsA("ProximityPrompt") and prompt or nil,
-                            Top = CFrame.new(Vector3.new(box.Position.X,
-                                box.Position.Y + size.Y * 0.5 + 10, box.Position.Z)),
-                        }, distance
+        for _ = 1, tonumber(tries) or S.pickupRetries or 8 do
+            if HUB.dead then
+                return false, "unload"
+            end
+
+            if #CarriedEggs() > before then
+                return true
+            end
+
+            if not egg.record.Parent then
+                return false, "egg gone"
+            end
+
+            local rendered = RenderedEggNear(egg.pos)
+            local prompt = rendered and rendered.prompt
+
+            TravelToCFrame(
+                (rendered and EggTopCFrame(rendered.model))
+                or CFrame.new(
+                    egg.pos
+                    + Vector3.new(
+                        0,
+                        EGG_HEIGHT_OFFSET,
+                        0
+                    )
+                )
+            )
+
+            if prompt and prompt.Parent then
+                local near = prompt.Parent
+                local hrp = GetHRP()
+                local maxDist =
+                    tonumber(prompt.MaxActivationDistance)
+                    or 10
+
+                if hrp
+                    and near:IsA("BasePart")
+                    and (
+                        hrp.Position - near.Position
+                    ).Magnitude > maxDist then
+
+                    TravelToCFrame(
+                        CFrame.new(
+                            near.Position
+                            + Vector3.new(
+                                0,
+                                math.max(3, maxDist - 2),
+                                0
+                            )
+                        )
+                    )
+                end
+            end
+
+            if volcanic then
+                local waited = 0
+                local sinceTp = 0
+                local settle =
+                    tonumber(S.lairSettle)
+                    or 1.0
+
+                local target =
+                    (rendered and EggTopCFrame(rendered.model))
+                    or CFrame.new(
+                        egg.pos
+                        + Vector3.new(
+                            0,
+                            EGG_HEIGHT_OFFSET,
+                            0
+                        )
+                    )
+
+                while waited < settle
+                    and not ServerSeesInsideLair()
+                    and not HUB.dead do
+
+                    task.wait(0.05)
+                    waited = waited + 0.05
+                    sinceTp = sinceTp + 0.05
+
+                    if sinceTp >= 0.2 then
+                        sinceTp = 0
+                        TravelToCFrame(target)
                     end
                 end
             end
+
+            Claim()
+
+            if WaitBasket(0.06) then
+                return true
+            end
+
+            Claim()
+
+            if WaitBasket(0.18) then
+                return true
+            end
+
+            if lastPickup.mode == "BasketFull"
+                or (lastPickup.reason or ""):find("basket") then
+                return false, "carry full"
+            end
+
+            if volcanic
+                and (lastPickup.reason or ""):find("lair") then
+                EnterLair()
+            end
         end
+
+        if #CarriedEggs() > before then
+            return true
+        end
+
+        return false,
+            tostring(
+                lastPickup.reason
+                or lastPickup.mode
+                or "no response"
+            )
     end
-    return best
-end
 
-function Farm.arcServerSeesInsideLair()
-    return LocalPlayer:GetAttribute("InVolcano") == true
-end
+    local function DeliverCarried()
+        if #CarriedEggs() == 0 then
+            return false, "carry empty"
+        end
 
-function Farm.arcInsideLair()
-    local root = getRoot()
-    local bounds = Workspace:FindFirstChild("GuardianBounds")
-    if not root or not (bounds and bounds:IsA("BasePart")) then return false end
-    local point = bounds.CFrame:PointToObjectSpace(root.Position)
-    local half = bounds.Size * 0.5
-    return math.abs(point.X) <= half.X
-        and math.abs(point.Y) <= half.Y
-        and math.abs(point.Z) <= half.Z
-end
+        local plot = OwnPlot()
+        local base =
+            plot
+            and plot:FindFirstChild("Baseplate")
 
-function Farm.arcEnterLair()
-    if Farm.arcServerSeesInsideLair() then return true end
-    local volcano = Workspace:FindFirstChild("Volcano")
-    local door = volcano and volcano:FindFirstChild("VolcanoEntrance")
-    if not (door and door:IsA("BasePart")) and volcano then
-        for _, part in ipairs(volcano:GetChildren()) do
-            if part:IsA("BasePart") and string.find(string.lower(part.Name), "entrance", 1, true) then
-                door = part
+        if not base then
+            return false, "no plot"
+        end
+
+        local cashBefore = PlayerCash()
+
+        TravelToCFrame(
+            PartTopCFrame(base)
+            or CFrame.new(
+                base.Position
+                + Vector3.new(0, 6, 0)
+            )
+        )
+
+        local claim = ArrivalClaimRemote()
+        local names = {}
+
+        for _, c in ipairs(CarriedEggs()) do
+            names[#names + 1] = c.Name
+        end
+
+        for _ = 1, 8 do
+            if #CarriedEggs() == 0 then
                 break
             end
-        end
-    end
-    if not (door and door:IsA("BasePart")) then return false end
-    for _ = 1, 3 do
-        if not Farm.Alive or not Farm.Enabled then return false end
-        local look = door.CFrame.LookVector
-        for _, step in ipairs({ -7, 0, 7, 0 }) do
-            Farm.chilliPivotTo(CFrame.new(door.Position + look * step + Vector3.new(0, 2, 0)))
-            task.wait(0.12)
-        end
-        local waited = 0
-        while waited < Farm.Chilli.LairSettle do
-            if Farm.arcServerSeesInsideLair() then return true end
-            task.wait(0.05)
-            waited += 0.05
-        end
-    end
-    return Farm.arcServerSeesInsideLair() or Farm.arcInsideLair()
-end
 
-function Farm.arcSetFarmNoclip(enabled)
-    local state = Farm.Chilli
-    state.NoclipActive = enabled and true or false
-    if not state.NoclipActive then
-        for part, original in pairs(state.CollisionBackup) do
-            if part.Parent then part.CanCollide = original end
-            state.CollisionBackup[part] = nil
-        end
-    end
-end
+            if claim then
+                local hrp = GetHRP()
 
-function Farm.arcShouldPause()
-    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
-        or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
-        return true
-    end
-    local state, root = Farm.Chilli, getRoot()
-    if root and state.LastPlacedPos and os.clock() - state.LastPlacedAt >= 0.6
-        and (root.Position - state.LastPlacedPos).Magnitude > 40 then
-        state.ManualUntil = os.clock() + 1.5
-        state.LastPlacedPos = root.Position
-    end
-    return os.clock() < state.ManualUntil
-end
-
-trackFarmConnection(RunService.Stepped:Connect(function()
-    local state = Farm.Chilli
-    if not state.NoclipActive then return end
-    local character = getCharacter()
-    if not character then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") then
-            if state.CollisionBackup[part] == nil then
-                state.CollisionBackup[part] = part.CanCollide
-            end
-            if part.CanCollide then part.CanCollide = false end
-        end
-    end
-end))
-
-function Farm.chilliActiveEggs()
-    local serverData = ReplicatedStorage:FindFirstChild("ServerData")
-    return serverData and serverData:FindFirstChild("ActiveEggs")
-end
-
-function Farm.chilliPlotParts()
-    local plot = getOwnedPlot()
-    local baseplate = plot and plot:FindFirstChild("Baseplate")
-    if not baseplate or not baseplate:IsA("BasePart") then
-        return nil, nil
-    end
-    return baseplate, baseplate.Position + Vector3.new(0, baseplate.Size.Y / 2, 0)
-end
-
-function Farm.chilliBasketCapacity()
-    local saved = LocalPlayer:FindFirstChild("SavedData")
-    local equipped = saved and saved:FindFirstChild("EquippedEggBasket")
-    local baskets = loadGameDataModule("EggBaskets") or {}
-    local data = equipped and baskets[tostring(equipped.Value)]
-    local capacity = type(data) == "table" and tonumber(data.Capacity) or 1
-    return math.max(1, math.min(capacity or 1, 50))
-end
-
-function Farm.chilliBasketDeadline()
-    local basket = LocalPlayer:FindFirstChild("Basket")
-    local earliest
-    if basket then
-        for _, egg in ipairs(basket:GetChildren()) do
-            local at = tonumber(egg:GetAttribute("BreakAt"))
-            if at and (not earliest or at < earliest) then
-                earliest = at
-            end
-        end
-    end
-    return earliest
-end
-
-function Farm.chilliRoute(start, goal)
-    if Vector3.new(goal.X - start.X, 0, goal.Z - start.Z).Magnitude < 80
-        and math.abs(goal.Y - start.Y) < 30 then
-        return { goal }
-    end
-    local cruiseY = math.max(start.Y, goal.Y) + Farm.Config.FlightCruiseHeight
-    return { Vector3.new(start.X, cruiseY, start.Z),
-        Vector3.new(goal.X, cruiseY, goal.Z), goal }
-end
-
-function Farm.chilliTravelTime(start, goal)
-    local length = 0
-    for _, point in ipairs(Farm.chilliRoute(start, goal)) do
-        length += (point - start).Magnitude
-        start = point
-    end
-    return length / math.max(Farm.Config.FlightSpeed, 20)
-end
-
-function Farm.chilliFlyTo(goal, shouldStop, radius, direct)
-    local root = getRoot()
-    if not root or typeof(goal) ~= "Vector3" then
-        return false
-    end
-    radius = radius or 3
-    if (root.Position - goal).Magnitude <= radius then
-        return true
-    end
-    clearPlatform()
-    root.Anchored = false
-    local route = direct and { goal } or Farm.chilliRoute(root.Position, goal)
-    local travelTime = direct
-        and (goal - root.Position).Magnitude / math.max(Farm.Config.FlightSpeed, 20)
-        or Farm.chilliTravelTime(root.Position, goal)
-    local deadline = os.clock() + travelTime + 6
-    local originalCollisions = {}
-    local function setNoclip()
-        local character = getCharacter()
-        if character then
-            for _, part in ipairs(character:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    if originalCollisions[part] == nil then
-                        originalCollisions[part] = part.CanCollide
-                    end
-                    part.CanCollide = false
+                if hrp then
+                    pcall(function()
+                        claim:FireServer(
+                            Workspace:GetServerTimeNow(),
+                            hrp.Position,
+                            names
+                        )
+                    end)
                 end
             end
-        end
-    end
-    setNoclip()
-    local connection = RunService.Stepped:Connect(setNoclip)
-    local index, arrived = 1, false
-    local ok, err = pcall(function()
-        while Farm.Alive and os.clock() < deadline do
-            if shouldStop and shouldStop() then
-                break
-            end
-            local dt = RunService.Heartbeat:Wait()
-            root = getRoot()
-            if not root then
-                break
-            end
-            local final = index == #route
-            local delta = route[index] - root.Position
-            local distance = delta.Magnitude
-            if distance <= (final and radius or 2) then
-                if final then
-                    arrived = true
+
+            for _ = 1, 8 do
+                task.wait(0.02)
+
+                if #CarriedEggs() == 0 then
                     break
                 end
-                index += 1
-            else
-                local step = math.min(distance, math.max(Farm.Config.FlightSpeed, 20) * dt)
-                local horizontal = Vector3.new(delta.X, 0, delta.Z)
-                local facing = horizontal.Magnitude > 0.1
-                    and CFrame.lookAt(Vector3.zero, horizontal.Unit) or root.CFrame.Rotation
-                root.CFrame = CFrame.new(root.Position + delta.Unit * step) * facing
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
-            end
-        end
-    end)
-    connection:Disconnect()
-    for part, wasCollidable in pairs(originalCollisions) do
-        if part.Parent then
-            part.CanCollide = wasCollidable
-        end
-    end
-    root = getRoot()
-    if root then
-        root.AssemblyLinearVelocity = Vector3.zero
-    end
-    if not ok then
-        Farm.LastError = tostring(err)
-        setFarmStatus("Chilli flight error: " .. tostring(err))
-    end
-    return ok and (arrived or (root and (root.Position - goal).Magnitude <= radius + 1)) or false
-end
-
-function Farm.chilliOutsidePlotPoint(baseplate, plotTop, currentPosition)
-    local localPosition = baseplate.CFrame:PointToObjectSpace(currentPosition)
-    local direction = Vector3.new(localPosition.X, 0, localPosition.Z)
-    if direction.Magnitude < 1 then
-        direction = Vector3.new(0, 0, 1)
-    end
-    local halfX, halfZ = baseplate.Size.X / 2, baseplate.Size.Z / 2
-    local unit = direction.Unit
-    local outside = unit / math.max(math.abs(unit.X) / (halfX + 20),
-        math.abs(unit.Z) / (halfZ + 20))
-    local world = baseplate.CFrame:PointToWorldSpace(Vector3.new(outside.X, 0, outside.Z))
-    return Vector3.new(world.X, plotTop.Y + 4, world.Z)
-end
-
-function Farm.chilliEggData(name)
-    local eggs = loadGameDataModule("Eggs") or {}
-    local data = eggs[tostring(name)]
-    return type(data) == "table" and data or nil
-end
-
-function Farm.chilliRank(name)
-    local ranks = { Common = 1, Rare = 2, Epic = 3, Legendary = 4,
-        Mythic = 5, Ethereal = 6, Divine = 7, Volcanic = 8 }
-    local data = Farm.chilliEggData(name)
-    return data and (ranks[tostring(data.Rarity)] or 0) or 0
-end
-
-function Farm.chilliPlan(position)
-    local folder = Farm.chilliActiveEggs()
-    local _, plotTop = Farm.chilliPlotParts()
-    local state = Farm.Chilli
-    local candidates = {}
-    if not folder then
-        return candidates
-    end
-    local selectedCount = Farm.selectedCount()
-    for _, config in ipairs(folder:GetChildren()) do
-        local eggName = config:GetAttribute("Egg")
-        local eggPos = config:GetAttribute("Position")
-        local privateTo = config:GetAttribute("PrivateTo")
-        local dropEndsAt = tonumber(config:GetAttribute("DropEndsAt"))
-        local rejected = state.RejectedUntil[config.Name] or 0
-        if type(eggName) == "string" and typeof(eggPos) == "Vector3"
-            and (privateTo == nil or privateTo == LocalPlayer.UserId)
-            and (not dropEndsAt or dropEndsAt <= Workspace:GetServerTimeNow())
-            and rejected <= os.clock() then
-            local rank = Farm.chilliRank(eggName)
-            local data = Farm.chilliEggData(eggName)
-            local luck = data and tonumber(data.Luck) or 0
-            local sell = data and tonumber(data.SellPrice) or 0
-            local growth = data and tonumber(data.GrowthTime) or 0
-            if rank >= state.MinRank
-                and (selectedCount == 0 or Farm.Selected[normalizeEggName(eggName)]) then
-                table.insert(candidates, {
-                    Config = config, Name = eggName, Position = eggPos,
-                    Rank = rank, Luck = luck, Sell = sell, Growth = growth,
-                    Distance = (eggPos - position).Magnitude,
-                })
-            end
-        end
-    end
-    table.sort(candidates, function(a, b)
-        local priority = state.Priority
-        if priority == "Nearest" then
-            return a.Distance < b.Distance
-        elseif priority == "Farthest" then
-            return a.Distance > b.Distance
-        elseif priority == "Highest Rarity" and a.Rank ~= b.Rank then
-            return a.Rank > b.Rank
-        elseif priority == "Highest Luck" and a.Luck ~= b.Luck then
-            return a.Luck > b.Luck
-        end
-        local function score(item)
-            local value = item.Rank * 1000 + item.Luck + item.Sell * 10
-            if priority == "Fast Cycle" then
-                return value / math.max(item.Distance / 200 + item.Growth + 2, 1)
-            end
-            return value - item.Distance * 0.1
-        end
-        return score(a) > score(b)
-    end)
-    return candidates
-end
-
-function Farm.chilliManualTarget()
-    local state = Farm.Chilli
-    local folder = Farm.chilliActiveEggs()
-    while folder and #state.Manual > 0 do
-        local config = folder:FindFirstChild(state.Manual[1])
-        local name = config and config:GetAttribute("Egg")
-        local position = config and config:GetAttribute("Position")
-        local privateTo = config and config:GetAttribute("PrivateTo")
-        if type(name) == "string" and typeof(position) == "Vector3"
-            and (privateTo == nil or privateTo == LocalPlayer.UserId) then
-            return { Config = config, Name = name, Position = position, Manual = true }
-        end
-        table.remove(state.Manual, 1)
-    end
-    return nil
-end
-
-function Farm.chilliRemoveManual(name)
-    local index = table.find(Farm.Chilli.Manual, name)
-    if index then
-        table.remove(Farm.Chilli.Manual, index)
-    end
-end
-
-function Farm.chilliRelay(baseplate, plotTop, shouldStop)
-    local state = Farm.Chilli
-    local root = getRoot()
-    local basket = LocalPlayer:FindFirstChild("Basket")
-    local active = Farm.chilliActiveEggs()
-    if not root or not basket or not active then
-        return
-    end
-    local offset = baseplate.CFrame:PointToObjectSpace(root.Position)
-    local direction = Vector3.new(offset.X, 0, offset.Z)
-    if direction.Magnitude < 1 then
-        direction = Vector3.new(0, 0, 1)
-    end
-    local halfX, halfZ = baseplate.Size.X / 2, baseplate.Size.Z / 2
-    local unit = direction.Unit
-    local edge = unit / math.max(math.abs(unit.X) / (halfX + 20),
-        math.abs(unit.Z) / (halfZ + 20))
-    local world = baseplate.CFrame:PointToWorldSpace(Vector3.new(edge.X, 0, edge.Z))
-    local relayPoint = Vector3.new(world.X, plotTop.Y + 4, world.Z)
-    Farm.chilliFlyTo(relayPoint, shouldStop, 4)
-    root = getRoot()
-    if not root or (root.Position - relayPoint).Magnitude > 10 then
-        return
-    end
-    setFarmStatus("Re-picking eggs near base")
-    local holdUntil = os.clock() + 0.3
-    while os.clock() < holdUntil do
-        root = getRoot()
-        if root then
-            root.CFrame = CFrame.new(relayPoint) * root.CFrame.Rotation
-            root.AssemblyLinearVelocity = Vector3.zero
-        end
-        RunService.Heartbeat:Wait()
-    end
-    local existing, dropped, appeared = {}, {}, {}
-    for _, config in ipairs(active:GetChildren()) do
-        existing[config] = true
-    end
-    for _, egg in ipairs(basket:GetChildren()) do
-        local name = egg:GetAttribute("Egg")
-        if type(name) == "string" then
-            table.insert(dropped, name)
-        end
-    end
-    state.Relaying = true
-    for _, name in ipairs(dropped) do
-        fireGameRemote("BasketDrop", name)
-    end
-    local deadline = os.clock() + 3
-    while #appeared < #dropped and os.clock() < deadline do
-        for _, config in ipairs(active:GetChildren()) do
-            if not existing[config] and config:GetAttribute("OriginPosition") ~= nil
-                and typeof(config:GetAttribute("Position")) == "Vector3" then
-                existing[config] = true
-                table.insert(appeared, config)
-            end
-        end
-        RunService.Heartbeat:Wait()
-    end
-    for _, config in ipairs(appeared) do
-        local position = config:GetAttribute("Position")
-        for _ = 1, 3 do
-            if not config.Parent then
-                break
-            end
-            if typeof(position) == "Vector3" then
-                Farm.chilliFlyTo(position + Vector3.new(0, 3, 0), nil, 5)
-            end
-            local before = getBasketCount()
-            state.LastPickupAt = os.clock()
-            fireGameRemote("EggPickup", config.Name)
-            local pickupDeadline = os.clock() + 1.5
-            while getBasketCount() == before and os.clock() < pickupDeadline do
-                RunService.Heartbeat:Wait()
-            end
-            if before < getBasketCount() then
-                break
-            end
-        end
-        if config.Parent and not table.find(state.Manual, config.Name) then
-            table.insert(state.Manual, 1, config.Name)
-        end
-    end
-    state.Relaying = false
-end
-
-function Farm.chilliDeliver(shouldStop)
-    if getBasketCount() <= 0 then
-        return false
-    end
-    local baseplate = Farm.chilliPlotParts()
-    if not baseplate then
-        setFarmStatus("Delivery: own Baseplate not found")
-        return false
-    end
-    local depositsBefore = Farm.Chilli.DepositedCount
-    local basket = LocalPlayer:FindFirstChild("Basket")
-    local names = {}
-    if basket then
-        for _, item in ipairs(basket:GetChildren()) do
-            names[#names + 1] = item.Name
-        end
-    end
-    setFarmStatus("RideAPet delivery: pivoting onto Baseplate")
-    local baseTop = baseplate.CFrame * CFrame.new(0, baseplate.Size.Y / 2 + 10, 0)
-    if not Farm.chilliPivotTo(baseTop) then
-        setFarmStatus("Delivery: character pivot failed")
-        return false
-    end
-
-    -- Match ARC's immediate pivot-home and eight spaced arrival claims.
-    for attempt = 1, 8 do
-        if getBasketCount() == 0 or (shouldStop and shouldStop()) then
-            break
-        end
-        local root = getRoot()
-        if not root then break end
-        fireGameRemote("EggArrivalClaim", Workspace:GetServerTimeNow(), root.Position, names)
-        for _ = 1, 8 do
-            if getBasketCount() == 0 then
-                break
-            end
-            task.wait(0.02)
-        end
-    end
-
-    if getBasketCount() > 0 then
-        setFarmStatus("ARC delivery: basket still occupied")
-        return false
-    end
-    table.clear(Farm.Chilli.Carried)
-    Farm.Chilli.PickupPos = nil
-    setFarmStatus(Farm.Chilli.DepositedCount > depositsBefore
-        and "ARC delivery: Deposited" or "ARC delivery: basket emptied")
-    return true
-end
-
-function Farm.chilliCollectStep(shouldStop)
-    local state = Farm.Chilli
-    local stop = shouldStop or function() return not Farm.Alive or not Farm.Enabled end
-    if not getRoot() or stop() then return false end
-    if getBasketCount() > 0 then return Farm.chilliDeliver(nil) end
-
-    local target = Farm.chilliManualTarget()
-    if not target then
-        local plan = Farm.chilliPlan(getRoot().Position)
-        target = plan[1]
-    end
-    if not target then
-        setFarmStatus("No egg matches the filters")
-        return false
-    end
-
-    local name, before = target.Config.Name, getBasketCount()
-    local volcanic = normalizeEggName(target.Name) == "Volcano Egg"
-    state.Target = name
-    state.TargetManual = target.Manual == true
-    state.LastPickupAt = os.clock()
-    state.PickupPos = target.Position
-    state.LastPickup = { Mode = nil, Reason = nil, Name = target.Name }
-    setFarmStatus("ARC pickup: " .. target.Name)
-
-    if volcanic and state.VolcanicLairPath and not Farm.arcServerSeesInsideLair() then
-        Farm.arcEnterLair()
-    end
-
-    local function waitBasket(seconds)
-        local waited = 0
-        while waited < seconds and getBasketCount() == before and not stop() do
-            task.wait(0.02)
-            waited += 0.02
-        end
-        return getBasketCount() > before
-    end
-
-    for _ = 1, state.PickupRetries do
-        if stop() or getBasketCount() > before or not target.Config.Parent then break end
-        local rendered = Farm.arcRenderedEggNear(target.Position)
-        local top = rendered and rendered.Top or CFrame.new(target.Position + Vector3.new(0, 10, 0))
-        Farm.chilliPivotTo(top)
-        local prompt = rendered and rendered.Prompt
-        local part = prompt and prompt.Parent
-        if part and part:IsA("BasePart") then
-            local root = getRoot()
-            local maxDistance = tonumber(prompt.MaxActivationDistance) or 10
-            if root and (root.Position - part.Position).Magnitude > maxDistance then
-                Farm.chilliPivotTo(CFrame.new(part.Position
-                    + Vector3.new(0, math.max(3, maxDistance - 2), 0)))
             end
         end
 
-        if volcanic then
-            local waited, sincePivot = 0, 0
-            while waited < state.LairSettle and not Farm.arcServerSeesInsideLair() and not stop() do
+        if #CarriedEggs() > 0 then
+            return false, "delivery stuck"
+        end
+
+        S.stats.delivered = S.stats.delivered + 1
+
+        local gained = PlayerCash() - cashBefore
+
+        if gained > 0 then
+            S.stats.cash = S.stats.cash + gained
+        end
+
+        task.spawn(function()
+            for _ = 1, 30 do
+                if HUB.dead then
+                    break
+                end
+
                 task.wait(0.05)
-                waited += 0.05
-                sincePivot += 0.05
-                if sincePivot >= 0.2 then
-                    sincePivot = 0
-                    Farm.chilliPivotTo(top)
+
+                local now = PlayerCash() - cashBefore
+
+                if now > gained then
+                    S.stats.cash =
+                        S.stats.cash
+                        + (now - gained)
+
+                    gained = now
+                elseif now > 0 then
+                    break
+                end
+
+                if gained > 0 then
+                    break
                 end
             end
-        end
+        end)
 
-        local function claim()
-            fireGameRemote("EggPickup", name)
-            if state.UsePrompt and prompt and prompt.Parent
-                and type(fireproximityprompt) == "function" then
-                local needsSight = prompt.RequiresLineOfSight == true
-                if part and part:IsA("BasePart") then
-                    local ok, tagged = pcall(function()
-                        return part:HasTag("EggPickupRequiresLineOfSight")
-                    end)
-                    needsSight = needsSight or (ok and tagged)
-                end
-                if needsSight and part and part:IsA("BasePart") then
-                    local camera = Workspace.CurrentCamera
-                    if camera then
+        return true, gained
+    end
+
+    local function EggTools()
+        local out = {}
+
+        for _, c in ipairs({
+            LP:FindFirstChild("Backpack"),
+            LP.Character,
+        }) do
+            if c then
+                for _, t in ipairs(c:GetChildren()) do
+                    local tagged = false
+
+                    if t:IsA("Tool") then
                         pcall(function()
-                            camera.CFrame = CFrame.lookAt(camera.CFrame.Position, part.Position)
+                            tagged = t:HasTag("Egg")
                         end)
                     end
+
+                    if t:IsA("Tool") and tagged then
+                        local info = EggInfo(t.Name)
+
+                        out[#out + 1] = {
+                            tool = t,
+                            name = t.Name,
+                            weight =
+                                tonumber(t:GetAttribute("Weight"))
+                                or 1,
+                            mutation =
+                                t:GetAttribute("Mutation"),
+                            rarity =
+                                (info and info.Rarity)
+                                or "?",
+                            luck =
+                                (info and info.Luck)
+                                or 0,
+                            equipped =
+                                t.Parent == LP.Character,
+                        }
+                    end
                 end
-                pcall(fireproximityprompt, prompt)
             end
         end
-        claim()
-        if waitBasket(0.06) then break end
-        claim()
-        if waitBasket(0.18) then break end
-        local feedback = state.LastPickup
-        local reason = string.lower(tostring(feedback.Reason or ""))
-        if feedback.Mode == "BasketFull" or reason:find("basket", 1, true) then break end
-        if volcanic and reason:find("lair", 1, true) then Farm.arcEnterLair() end
+
+        return out
     end
 
-    Farm.chilliRemoveManual(name)
-    state.Target = nil
-    if getBasketCount() <= before then
-        local feedback = state.LastPickup
-        setFarmStatus("ARC pickup failed: "
-            .. tostring(feedback.Reason or feedback.Mode or "no response"))
-        return false
-    end
-    state.Carried[name] = target.Config
-    Farm.chilliDeliver(nil)
-    return true
-end
+    local function HeldEggTool()
+        local char = LP.Character
+        if not char then
+            return nil
+        end
 
--- Chilli's scheduler gives an existing basket priority and collects only
--- after other ranch actions release their movement lock.
-task.spawn(function()
-    while Farm.Alive do
-        if Farm.AutomationBusy then
-            task.wait(0.15)
-        elseif Farm.Enabled and Farm.arcShouldPause() then
-            task.wait(0.15)
-        elseif Farm.Enabled and getRoot() and getOwnedPlot() then
-            Farm.AutomationBusy = true
-            local ok, err = pcall(function()
-                if getBasketCount() > 0 then
-                    Farm.chilliDeliver(function() return not Farm.Alive end)
+        for _, c in ipairs(char:GetChildren()) do
+            local tagged = false
+
+            if c:IsA("Tool") then
+                pcall(function()
+                    tagged = c:HasTag("Egg")
+                end)
+            end
+
+            if c:IsA("Tool") and tagged then
+                return c
+            end
+        end
+
+        return nil
+    end
+
+    local function FreeNest()
+        local plot = OwnPlot()
+        local nests = PlotNests(plot)
+
+        if not nests then
+            return nil, plot
+        end
+
+        for _, n in ipairs(nests:GetChildren()) do
+            if n:GetAttribute("Unlocked") == true
+                and not n:GetAttribute("Occupied") then
+                return n, plot
+            end
+        end
+
+        return nil, plot
+    end
+
+    local function NestPosition(nest, plot)
+        local anchor =
+            nest:FindFirstChild("PlacePromptAnchor")
+
+        if anchor and anchor:IsA("BasePart") then
+            return anchor.Position
+        end
+
+        local model = nest:FindFirstChild("Model")
+
+        if model then
+            return model:GetPivot().Position
+        end
+
+        local base =
+            plot
+            and plot:FindFirstChild("Baseplate")
+
+        return base and base.Position or nil
+    end
+
+    local function PlantBestEgg(minLuck)
+        if HUB.dead then
+            return false, "unload"
+        end
+
+        local remote = EggPlacedRemote()
+
+        if not remote then
+            return false, "EggPlaced remote missing"
+        end
+
+        local nest, plot = FreeNest()
+
+        if not nest then
+            return false, "no free nest"
+        end
+
+        local pick
+
+        for _, entry in ipairs(EggTools()) do
+            if entry.luck >= (tonumber(minLuck) or 0) then
+                if not pick
+                    or entry.luck > pick.luck
+                    or (
+                        entry.luck == pick.luck
+                        and RarityRank(entry.rarity)
+                            > RarityRank(pick.rarity)
+                    ) then
+                    pick = entry
                 end
-                if Farm.Enabled and getBasketCount() == 0 then
-                    Farm.chilliCollectStep(function()
-                        return not Farm.Alive or not Farm.Enabled
-                    end)
+            end
+        end
+
+        if not pick then
+            return false, "no egg in inventory"
+        end
+
+        local humanoid = GetHumanoid()
+
+        if not humanoid then
+            return false, "no humanoid"
+        end
+
+        if HeldEggTool() ~= pick.tool then
+            pcall(function()
+                humanoid:UnequipTools()
+            end)
+
+            task.wait(0.1)
+
+            pcall(function()
+                humanoid:EquipTool(pick.tool)
+            end)
+
+            task.wait(0.35)
+        end
+
+        if not HeldEggTool() then
+            return false, "egg not equipped"
+        end
+
+        local eggsFolder =
+            plot
+            and PlotEggs(plot)
+
+        local before =
+            eggsFolder
+            and #eggsFolder:GetChildren()
+            or 0
+
+        local pos = NestPosition(nest, plot)
+
+        if pos then
+            TravelTo(pos, 4)
+            task.wait(0.25)
+        end
+
+        if nest:GetAttribute("Occupied") == true then
+            return false, "nest already taken"
+        end
+
+        if LP:GetAttribute("NoNest") == true then
+            local base =
+                plot
+                and plot:FindFirstChild("Baseplate")
+
+            local plantPos =
+                base
+                and base.Position
+                or pos
+
+            if not plantPos then
+                return false, "no position"
+            end
+
+            pcall(function()
+                remote:FireServer({
+                    PlantPosition = plantPos,
+                })
+            end)
+        else
+            pcall(function()
+                remote:FireServer({
+                    NestId = nest.Name,
+                })
+            end)
+        end
+
+        local placed = false
+
+        for _ = 1, 8 do
+            task.wait(0.15)
+
+            if nest:GetAttribute("Occupied") == true
+                or (
+                    eggsFolder
+                    and #eggsFolder:GetChildren() > before
+                ) then
+                placed = true
+                break
+            end
+        end
+
+        if placed then
+            S.stats.planted = S.stats.planted + 1
+            return true, pick.name
+        end
+
+        return false, "place refused"
+    end
+
+    local function GrowthRemaining(egg)
+        local data = egg:FindFirstChild("EggData")
+        local placeTime =
+            data
+            and data:FindFirstChild("PlaceTime")
+
+        local weight =
+            data
+            and data:FindFirstChild("Weight")
+
+        local info = EggInfo(egg.Name)
+
+        if not (
+            placeTime
+            and placeTime.Value > 0
+            and info
+        ) then
+            return 0
+        end
+
+        local growth = info.GrowthTime or 0
+
+        if GeneralData
+            and GeneralData.GrowthTimeFor then
+
+            local ok, res =
+                pcall(
+                    GeneralData.GrowthTimeFor,
+                    growth,
+                    (weight and weight.Value)
+                        or 1
+                )
+
+            if ok and type(res) == "number" then
+                growth = res
+            end
+        end
+
+        local elapsed
+
+        if DayNightSvc
+            and DayNightSvc.GrowthElapsed then
+
+            local ok, res =
+                pcall(
+                    DayNightSvc.GrowthElapsed,
+                    placeTime.Value
+                )
+
+            if ok and type(res) == "number" then
+                elapsed = res
+            end
+        end
+
+        elapsed =
+            elapsed
+            or (
+                Workspace:GetServerTimeNow()
+                - placeTime.Value
+            )
+
+        return math.max(growth - elapsed, 0)
+    end
+
+    local function HatchEgg(egg)
+        local pp =
+            egg.PrimaryPart
+            or egg:FindFirstChildWhichIsA(
+                "BasePart",
+                true
+            )
+
+        local prompt =
+            egg:FindFirstChild("Hatch", true)
+
+        if prompt
+            and prompt:IsA("ProximityPrompt") then
+
+            if pp then
+                TravelToCFrame(
+                    PartTopCFrame(pp)
+                    or CFrame.new(
+                        pp.Position
+                        + Vector3.new(0, 10, 0)
+                    )
+                )
+
+                task.wait(PROMPT_SETTLE)
+            end
+
+            return FirePrompt(prompt), "prompt"
+        end
+
+        local key = egg:GetAttribute("EggKey")
+
+        if not key then
+            return false, "no egg key"
+        end
+
+        local remote = Remote("Hatch")
+
+        if not remote then
+            return false, "hatch remote missing"
+        end
+
+        if pp then
+            TravelTo(pp.Position, 4)
+            task.wait(0.2)
+        end
+
+        return (
+            pcall(function()
+                remote:FireServer({
+                    EggKey = key,
+                })
+            end)
+        ), "remote"
+    end
+
+    local function HatchReadyEggs()
+        local plot = OwnPlot()
+        local eggs = PlotEggs(plot)
+
+        if not eggs then
+            return 0
+        end
+
+        local before = #eggs:GetChildren()
+        local fired = 0
+
+        for _, egg in ipairs(eggs:GetChildren()) do
+            local prompt =
+                egg:FindFirstChild("Hatch", true)
+
+            local available =
+                prompt
+                and prompt:GetAttribute(
+                    "HatchPromptAvailable"
+                )
+
+            local remaining =
+                GrowthRemaining(egg)
+
+            if available == true
+                or remaining <= 0 then
+
+                if HatchEgg(egg) then
+                    fired = fired + 1
+                end
+
+                task.wait(S.hatchDelay)
+            end
+        end
+
+        if fired == 0 then
+            return 0
+        end
+
+        local count = 0
+
+        for _ = 1, 40 do
+            task.wait(0.25)
+
+            local now =
+                (eggs.Parent and #eggs:GetChildren())
+                or 0
+
+            count =
+                math.max(
+                    before - now,
+                    0
+                )
+
+            if count >= fired then
+                break
+            end
+        end
+
+        S.stats.hatched =
+            S.stats.hatched + count
+
+        return count
+    end
+
+    local BODY_PARTS = {
+        HumanoidRootPart = true,
+        Head = true,
+        UpperTorso = true,
+        LowerTorso = true,
+        Torso = true,
+        LeftUpperArm = true,
+        RightUpperArm = true,
+        LeftLowerArm = true,
+        RightLowerArm = true,
+        LeftHand = true,
+        RightHand = true,
+        LeftUpperLeg = true,
+        RightUpperLeg = true,
+        LeftLowerLeg = true,
+        RightLowerLeg = true,
+        LeftFoot = true,
+        RightFoot = true,
+    }
+
+    local function RestoreCollisions()
+        local char = LP.Character
+        if not char then
+            return
+        end
+
+        for _, d in ipairs(char:GetChildren()) do
+            if d:IsA("BasePart")
+                and BODY_PARTS[d.Name]
+                and not d.CanCollide then
+
+                pcall(function()
+                    d.CanCollide = true
+                end)
+            end
+        end
+    end
+
+    local function StartNoclip()
+        if HUB.noclipConn then
+            return
+        end
+
+        HUB.noclipConn =
+            RunService.Stepped:Connect(function()
+                if not S.farmNoclipActive then
+                    return
+                end
+
+                local char = LP.Character
+                if not char then
+                    return
+                end
+
+                for _, d in ipairs(char:GetDescendants()) do
+                    if d:IsA("BasePart")
+                        and d.CanCollide then
+                        d.CanCollide = false
+                    end
                 end
             end)
-            Farm.AutomationBusy = false
-            if not ok then
-                Farm.LastError = tostring(err)
-                setFarmStatus("Chilli collect error: " .. tostring(err))
-            end
-            task.wait(ok and 0.15 or 1)
+
+        track(HUB.noclipConn)
+    end
+
+    local function SetFarmNoclip(on)
+        if S.farmNoclipActive == on then
+            return
+        end
+
+        S.farmNoclipActive = on
+
+        if on then
+            StartNoclip()
         else
-            task.wait(1)
+            task.delay(
+                0.4,
+                RestoreCollisions
+            )
         end
     end
-end)
+
+    -- Exact source loop order and waits.
+    local function EggLoopStep()
+        if S.busy then
+            return
+        end
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+            or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
+            return
+        end
+
+        local hrpNow = GetHRP()
+
+        if hrpNow
+            and HUB.lastPlacedPos
+            and HUB.lastPlacedAt then
+
+            local fresh =
+                (os.clock() - HUB.lastPlacedAt) < 0.6
+
+            if not fresh
+                and (
+                    hrpNow.Position - HUB.lastPlacedPos
+                ).Magnitude > 40 then
+
+                HUB.manualUntil =
+                    os.clock() + 1.5
+
+                HUB.lastPlacedPos =
+                    hrpNow.Position
+
+                if (
+                    os.clock()
+                    - (HUB.manualWarnAt or 0)
+                ) > 8 then
+                    HUB.manualWarnAt = os.clock()
+                    Notify(
+                        "Auto Farm",
+                        "Paused - the character was moved externally",
+                        "Info",
+                        3
+                    )
+                end
+            end
+        end
+
+        if HUB.manualUntil
+            and os.clock() < HUB.manualUntil then
+            return
+        end
+
+        S.busy = true
+        local did = false
+
+        local ok, err = pcall(function()
+            if #CarriedEggs() == 0 then
+                local target = PickTargetEgg()
+
+                if target then
+                    local got, why =
+                        CollectEgg(target)
+
+                    if got then
+                        S.stats.eggs =
+                            S.stats.eggs + 1
+
+                        did = true
+                    else
+                        S.lastEggError =
+                            tostring(why)
+                    end
+                end
+            end
+
+            local delay =
+                tonumber(S.deliverDelay)
+                or 0
+
+            if did and delay > 0 then
+                local t0 = os.clock()
+
+                while not HUB.dead
+                    and (
+                        os.clock() - t0
+                    ) < delay do
+                    task.wait(0.02)
+                end
+            end
+
+            if #CarriedEggs() > 0
+                and S.autoDeliver then
+
+                if DeliverCarried() then
+                    did = true
+                end
+            end
+
+            local now = os.clock()
+            local every =
+                tonumber(S.sideInterval)
+                or 3
+
+            if every >= 0
+                and (
+                    now - (HUB.lastSideAt or 0)
+                ) >= every then
+
+                HUB.lastSideAt = now
+
+                if S.autoPlant then
+                    PlantBestEgg(
+                        S.plantMinLuck
+                    )
+                end
+
+                if S.autoHatch then
+                    HatchReadyEggs()
+                end
+            end
+        end)
+
+        if not ok then
+            S.lastEggError = tostring(err)
+        end
+
+        S.busy = false
+        return did
+    end
+
+    local function StartLoops()
+        if HUB.loopsRunning then
+            return
+        end
+
+        HUB.loopsRunning = true
+
+        task.spawn(function()
+            while not HUB.dead do
+                if S.eggLoop then
+                    SetFarmNoclip(
+                        S.farmNoclip
+                    )
+
+                    local ok, did =
+                        pcall(EggLoopStep)
+
+                    if did then
+                        local extra =
+                            tonumber(S.eggLoopDelay)
+                            or 0
+
+                        if extra > 0 then
+                            task.wait(extra)
+                        end
+                    else
+                        task.wait(0.12)
+                    end
+                else
+                    SetFarmNoclip(false)
+                    task.wait(0.25)
+                end
+            end
+        end)
+    end
+
+    Farm.CrystalEgg.SetEnabled = function(enabled)
+        S.eggLoop = enabled and true or false
+        Farm.Enabled = S.eggLoop
+        StartLoops()
+    end
+
+    Farm.CrystalEgg.SetFarmNoclip = SetFarmNoclip
+    Farm.CrystalEgg.PickTargetEgg = PickTargetEgg
+    Farm.CrystalEgg.CollectEgg = CollectEgg
+    Farm.CrystalEgg.DeliverCarried = DeliverCarried
+    Farm.CrystalEgg.PlantBestEgg = PlantBestEgg
+    Farm.CrystalEgg.HatchReadyEggs = HatchReadyEggs
+    Farm.CrystalEgg.EggRecords = EggRecords
+    Farm.CrystalEgg.EggTools = EggTools
+    Farm.CrystalEgg.CarriedEggs = CarriedEggs
+    Farm.CrystalEgg.OwnPlot = OwnPlot
+    Farm.CrystalEgg.LastPickup = function()
+        return lastPickup
+    end
+
+    Farm.CrystalEgg.Stop = function()
+        S.eggLoop = false
+        HUB.dead = true
+        SetFarmNoclip(false)
+
+        for _, conn in ipairs(HUB.conns) do
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+
+        HUB.conns = {}
+    end
+
+    StartLoops()
+end
+
+local crystalEggOk, crystalEggErr =
+    pcall(Farm.InitializeCrystalEggEngine)
+
+Farm.InitializeCrystalEggEngine = nil
+
+if not crystalEggOk then
+    warn(
+        "[CrystalHub] egg engine init error: "
+        .. tostring(crystalEggErr)
+    )
+end
+
+function Farm.setAutoFarm(enabled)
+    enabled = enabled and true or false
+    Farm.Enabled = enabled
+
+    if Farm.CrystalEgg
+        and type(Farm.CrystalEgg.SetEnabled) == "function" then
+        Farm.CrystalEgg.SetEnabled(enabled)
+    end
+
+    setFarmStatus(
+        enabled
+        and "Crystal egg farm enabled"
+        or "Stopped"
+    )
+end
+
 
 -- Feed placed pets between egg runs and other ranch actions.
 task.spawn(function()
@@ -9557,7 +10625,10 @@ end)
 
 function Library:StopFeatures()
     Farm.Enabled = false
-    if Farm.arcSetFarmNoclip then Farm.arcSetFarmNoclip(false) end
+    if Farm.CrystalEgg
+        and type(Farm.CrystalEgg.SetEnabled) == "function" then
+        Farm.CrystalEgg.SetEnabled(false)
+    end
     Farm.TeleportFarmEnabled = false
     Farm.TeleportRejectedUntil = 0
     Farm.AutoPlaceEnabled = false
@@ -9587,6 +10658,11 @@ function Library:Unload()
     self._unloading = true
     Farm.Alive = false
     self:StopFeatures()
+
+    if Farm.CrystalEgg
+        and type(Farm.CrystalEgg.Stop) == "function" then
+        pcall(Farm.CrystalEgg.Stop)
+    end
 
     for _, connection in ipairs(Farm.Connections) do
         pcall(function()
@@ -9722,82 +10798,73 @@ function Farm.buildInterface()
     UI.SelectedLabel = infoSection:AddLabel("Selected eggs: All")
     UI.SpawnedCountLabel = infoSection:AddLabel("Spawned eggs detected: 0")
 
-    local farmSection = mainTab:AddSection("Auto Farm")
-    UI.AutoFarmToggle = farmSection:AddToggle("Enable Auto Farm", false, function(enabled)
-        Farm.setAutoFarm(enabled)
-        Farm.refreshInfoLabels()
+    local farmSection = mainTab:AddSection("Crystal Egg Farm")
 
-        Window:Notify({
-            Title = "Crystal Hub",
-            Text = enabled and "Auto Farm enabled." or "Auto Farm stopped.",
-            Duration = 3,
-            Kind = enabled and "success" or "info",
-        })
-    end, "farm_enabled")
+    UI.AutoFarmToggle = farmSection:AddToggle(
+        "Enable Auto Farm",
+        false,
+        function(enabled)
+            Farm.setAutoFarm(enabled)
+            Farm.refreshInfoLabels()
 
-    local eggPickupFeedback = getGameRemote("EggPickup")
-    if eggPickupFeedback then
-        trackFarmConnection(eggPickupFeedback.OnClientEvent:Connect(function(result, reason, name)
-            Farm.Chilli.LastPickup = {
-                Mode = tostring(result),
-                Reason = reason ~= nil and tostring(reason) or nil,
-                Name = name ~= nil and tostring(name) or nil,
-            }
-            if result == "Deposited" then
-                Farm.Chilli.DepositedCount += 1
-                setFarmStatus("Egg deposited")
+            Window:Notify({
+                Title = "Crystal Hub",
+                Text = enabled
+                    and "Auto Farm enabled."
+                    or "Auto Farm stopped.",
+                Duration = 3,
+                Kind = enabled
+                    and "success"
+                    or "info",
+            })
+        end,
+        "farm_enabled"
+    )
+
+    farmSection:AddDropdown(
+        "Egg Priority",
+        {
+            "Best Value",
+            "Fast Cycle",
+            "Nearest",
+        },
+        "Best Value",
+        function(value)
+            if Farm.CrystalEgg
+                and Farm.CrystalEgg.State then
+                Farm.CrystalEgg.State.eggPriority =
+                    tostring(value)
             end
-        end))
-    end
+        end,
+        "crystal_egg_priority"
+    )
 
-    farmSection:AddDropdown("Min Egg Rarity",
-        { "Any", "Common", "Rare", "Epic", "Legendary", "Mythic", "Ethereal", "Divine", "Volcanic" },
-        "Any", function(value)
-            Farm.Chilli.MinRank = ({ Common = 1, Rare = 2, Epic = 3, Legendary = 4,
-                Mythic = 5, Ethereal = 6, Divine = 7, Volcanic = 8 })[tostring(value)] or 0
-        end, "farm_chilli_min_rarity")
-    farmSection:AddDropdown("Collect Priority",
-        { "Best Value", "Fast Cycle", "Nearest", "Highest Luck", "Highest Rarity", "Farthest" },
-        "Best Value", function(value)
-            Farm.Chilli.Priority = tostring(value)
-        end, "farm_chilli_priority")
-    farmSection:AddToggle("Volcanic Lair Path", true, function(value)
-        Farm.Chilli.VolcanicLairPath = value and true or false
-    end, "farm_arc_volcanic_path")
-    farmSection:AddToggle("Also Fire Pickup Prompt", false, function(value)
-        Farm.Chilli.UsePrompt = value and true or false
-    end, "farm_arc_pickup_prompt")
-    farmSection:AddToggle("Farm Noclip", true, function(value)
-        Farm.Chilli.FarmNoclip = value and true or false
-        Farm.arcSetFarmNoclip(Farm.Enabled and Farm.Chilli.FarmNoclip)
-    end, "farm_arc_noclip")
+    farmSection:AddMultiDropdown(
+        "Rarities (empty = all)",
+        {
+            "Common",
+            "Rare",
+            "Epic",
+            "Legendary",
+            "Mythic",
+            "Ethereal",
+            "Divine",
+            "Volcanic",
+        },
+        {},
+        function(values)
+            if Farm.CrystalEgg
+                and Farm.CrystalEgg.State then
 
-    farmSection:AddButton("Return to My Plot", function()
-        local previous = Farm.Enabled
-        Farm.Enabled = true
-        setFarmStatus("Returning to plot...")
-        local ok = getBasketCount() > 0 and Farm.chilliDeliver(nil) or returnToPlot()
-        Farm.Enabled = previous
+                Farm.CrystalEgg.State.eggRarities = {}
 
-        if not previous then
-            setFarmStatus(ok and "Returned to plot" or "Plot not found")
-        end
-
-        Farm.refreshInfoLabels()
-    end, "farm_return_plot")
-
-    farmSection:AddButton("Refresh Egg Folder", function()
-        local folder = refreshRenderedEggs()
-        Window:Notify({
-            Title = "Crystal Hub",
-            Text = folder
-                and string.format("RenderedEggs found (%d objects).", Farm.spawnedCount())
-                or "RenderedEggs folder was not found.",
-            Duration = 3,
-            Kind = folder and "success" or "warning",
-        })
-        Farm.refreshInfoLabels()
-    end, "farm_refresh_folder")
+                for _, rarity in ipairs(values or {}) do
+                    Farm.CrystalEgg.State.eggRarities[rarity] = true
+                end
+            end
+        end,
+        "crystal_egg_rarities"
+    )
 
     --==================== AUTO FARM ====================--
     local autoTab = Window:AddTab("Auto Farm")
