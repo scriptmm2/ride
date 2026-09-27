@@ -5341,447 +5341,6 @@ function Farm.flyTo(goal, shouldStop, arrivalRadius, useNoclip)
     return arrived or (root and (root.Position - goal).Magnitude <= arrivalRadius + 1) or false
 end
 
-local function dumpClientAntiCheatCandidates(deep)
-    if type(writefile) ~= "function" then
-        return false, "Executor file writing is unavailable"
-    end
-    if Farm.FullDumpRunning then
-        return false, "Full client dump is already running"
-    end
-    Farm.FullDumpRunning = true
-    Farm.FullDumpStop = false
-
-    local ok, result = pcall(function()
-        local function stopRequested()
-            return Farm.FullDumpStop or not Farm.Alive
-        end
-        local stamp = os.date("!%Y%m%d_%H%M%S")
-        local prefix = (deep and "CrystalHub_FullDump_" or "CrystalHub_EggFocus_") .. stamp
-        local sections = {}
-        local files = {}
-        local errors = {}
-        local index = { deep and "Crystal Hub full client dump"
-            or "Crystal Hub focused egg-return dump", "UTC " .. stamp }
-        local patterns = {
-            "egg was returned", "egg will return", "egg returned",
-            "eggarrivalclaim", "eggdeliveryrules", "basketdrop",
-            "eggpickup", "collectedeggs", "breakat", "originposition",
-            "volkarislair", "anticheat", "anti-cheat", "anti cheat",
-            "security", "gamewarning", "gamemessage",
-        }
-        local scriptSeen, scripts = {}, {}
-        local focusPaths = {
-            "eggdeliveryrules", "eggspawnrules", "baskettracker", "eggspawning",
-            "gamewarning", "gamemessage", "volkarislair", "volcano",
-            "anticheat", "anti-cheat", "security", "basket",
-        }
-        local referenceCount, decompiledCount, bytecodeCount, closureCount = 0, 0, 0, 0
-        local writeFailures = 0
-
-        local function pathOf(item)
-            local valid, path = pcall(function() return item:GetFullName() end)
-            return valid and tostring(path) or tostring(item)
-        end
-
-        local function flush(section)
-            local bucket = sections[section]
-            if not bucket or bucket.Bytes == 0 then
-                return
-            end
-            bucket.Number += 1
-            local path = string.format("%s_%s_%03d.txt", prefix, section, bucket.Number)
-            local saved, err = pcall(writefile, path, table.concat(bucket.Lines))
-            if saved then
-                table.insert(files, path)
-            else
-                writeFailures += 1
-                table.insert(errors, path .. ": " .. tostring(err))
-            end
-            bucket.Lines, bucket.Bytes = {}, 0
-        end
-
-        local function append(section, value)
-            local bucket = sections[section]
-            if not bucket then
-                bucket = { Lines = {}, Bytes = 0, Number = 0 }
-                sections[section] = bucket
-            end
-            value = tostring(value)
-            if bucket.Bytes > 0 and bucket.Bytes + #value > 200000 then
-                flush(section)
-                task.wait(0.02)
-            end
-            table.insert(bucket.Lines, value)
-            bucket.Bytes += #value
-        end
-
-        local function scan(label, body)
-            local lineNumber = 0
-            for line in (body .. "\n"):gmatch("(.-)\n") do
-                if stopRequested() then
-                    break
-                end
-                lineNumber += 1
-                local lowered = string.lower(line)
-                for _, pattern in ipairs(patterns) do
-                    if string.find(lowered, pattern, 1, true) then
-                        append("REFERENCES", string.format("%s:%d [%s] %s\n",
-                            label, lineNumber, pattern, line))
-                        referenceCount += 1
-                    end
-                end
-                if lineNumber % 200 == 0 then
-                    task.wait(0.01)
-                end
-            end
-        end
-
-        local function addScript(item, origin)
-            if typeof(item) ~= "Instance" or scriptSeen[item] then
-                return
-            end
-            if item:IsA("LocalScript") or item:IsA("ModuleScript") or item:IsA("Script") then
-                local path = pathOf(item)
-                local lower = string.lower(path)
-                local score = 999
-                for i, marker in ipairs(focusPaths) do
-                    if string.find(lower, marker, 1, true) then
-                        score = i
-                        break
-                    end
-                end
-                if not deep and score == 999 then
-                    return
-                end
-                scriptSeen[item] = true
-                table.insert(scripts, { Object = item, Path = path, Origin = origin, Score = score })
-            end
-        end
-
-        local descendants = {}
-        local roots = deep and { game } or {
-            LocalPlayer:FindFirstChild("PlayerScripts"),
-            PlayerGui:FindFirstChild("Reusable"),
-            PlayerGui:FindFirstChild("Main"),
-            ReplicatedStorage:FindFirstChild("GameServices"),
-        }
-        for _, root in pairs(roots) do
-            if stopRequested() then
-                break
-            end
-            if root then
-                for _, item in ipairs(root:GetDescendants()) do
-                    table.insert(descendants, item)
-                end
-            end
-        end
-        for i, item in ipairs(descendants) do
-            if stopRequested() then
-                break
-            end
-            addScript(item, "DataModel")
-            if i % 100 == 0 then
-                task.wait(0.03)
-            end
-        end
-        for _, api in ipairs(deep and { "getscripts", "getloadedmodules", "getnilinstances" } or {}) do
-            if stopRequested() then
-                break
-            end
-            local fn = ((getgenv and getgenv()) or _G)[api]
-            if type(fn) ~= "function" then
-                fn = _G[api]
-            end
-            if type(fn) == "function" then
-                local found, items = pcall(fn)
-                if found and type(items) == "table" then
-                    for _, item in pairs(items) do
-                        addScript(item, api)
-                    end
-                else
-                    table.insert(errors, api .. ": " .. tostring(items))
-                end
-            end
-        end
-        table.sort(scripts, function(a, b)
-            return a.Score < b.Score or (a.Score == b.Score and a.Path < b.Path)
-        end)
-        if not deep then
-            while #scripts > 16 do
-                table.remove(scripts)
-            end
-        end
-        table.insert(index, string.format("Scripts found: %d", #scripts))
-        if not deep then
-            table.insert(index, "Focused mode: up to 16 matching scripts; no getgc scan")
-        end
-
-        for number, entry in ipairs(scripts) do
-            if stopRequested() then
-                break
-            end
-            setFarmStatus(string.format("Full dump: scripts %d/%d", number, #scripts))
-            local heading = string.format("\n===== SCRIPT %d | %s | %s =====\n",
-                number, entry.Path, entry.Origin)
-            append("SCRIPTS", heading)
-            local sourceOk, source = false, nil
-            if type(decompile) == "function" then
-                sourceOk, source = pcall(decompile, entry.Object)
-            end
-            if sourceOk and type(source) == "string" then
-                decompiledCount += 1
-                append("SCRIPTS", source .. "\n")
-                scan(entry.Path, source)
-            else
-                append("SCRIPTS", "[SOURCE UNAVAILABLE] " .. tostring(source) .. "\n")
-                local bytecodeFn = ((getgenv and getgenv()) or _G).getscriptbytecode
-                    or _G.getscriptbytecode
-                if type(bytecodeFn) == "function" then
-                    local byteOk, bytes = pcall(bytecodeFn, entry.Object)
-                    if byteOk and type(bytes) == "string" then
-                        local path = string.format("%s_BYTECODE_%04d.bin", prefix, number)
-                        local saved, err = pcall(writefile, path, bytes)
-                        if saved then
-                            bytecodeCount += 1
-                            table.insert(files, path)
-                            append("SCRIPTS", "[BYTECODE] " .. path .. "\n")
-                        else
-                            writeFailures += 1
-                            table.insert(errors, path .. ": " .. tostring(err))
-                        end
-                    end
-                end
-            end
-            task.wait(deep and 0.08 or 0.15)
-        end
-
-        for i, item in ipairs(descendants) do
-            if stopRequested() then
-                break
-            end
-            local kind = item.ClassName
-            if kind == "RemoteEvent" or kind == "RemoteFunction"
-                or kind == "UnreliableRemoteEvent" or kind == "BindableEvent"
-                or kind == "BindableFunction" then
-                append("REMOTES", kind .. " " .. pathOf(item) .. "\n")
-            elseif (kind == "TextLabel" or kind == "TextButton" or kind == "TextBox") then
-                local textOk, value = pcall(function() return item.Text end)
-                if textOk and type(value) == "string" and value ~= "" then
-                    local lower = string.lower(value)
-                    if string.find(lower, "egg", 1, true)
-                        or string.find(lower, "return", 1, true)
-                        or string.find(lower, "cheat", 1, true) then
-                        append("UI", pathOf(item) .. " = " .. value .. "\n")
-                        scan(pathOf(item), value)
-                    end
-                end
-            end
-            if i % 100 == 0 then
-                task.wait(0.03)
-            end
-        end
-
-        local gcFn = ((getgenv and getgenv()) or _G).getgc or _G.getgc
-        if deep and not stopRequested() and type(gcFn) == "function" then
-            local gcOk, objects = pcall(gcFn, false)
-            if not gcOk or type(objects) ~= "table" then
-                gcOk, objects = pcall(gcFn)
-            end
-            if gcOk and type(objects) == "table" then
-                local infoFn = (debug and debug.getinfo) or _G.getinfo
-                local constantsFn = (debug and debug.getconstants) or _G.getconstants
-                local upvaluesFn = (debug and debug.getupvalues) or _G.getupvalues
-                for _, fn in pairs(objects) do
-                    if stopRequested() then
-                        break
-                    end
-                    if type(fn) == "function" then
-                        closureCount += 1
-                        local infoOk, info = false, nil
-                        if type(infoFn) == "function" then
-                            infoOk, info = pcall(infoFn, fn)
-                        end
-                        local source = infoOk and type(info) == "table"
-                            and tostring(info.source or info.short_src or "?") or "?"
-                        local name = infoOk and type(info) == "table"
-                            and tostring(info.name or "?") or "?"
-                        local line = infoOk and type(info) == "table"
-                            and tostring(info.linedefined or "?") or "?"
-                        local envPath = "?"
-                        if type(getfenv) == "function" then
-                            local envOk, env = pcall(getfenv, fn)
-                            if envOk and type(env) == "table" and typeof(env.script) == "Instance" then
-                                envPath = pathOf(env.script)
-                            end
-                        end
-                        local label = string.format("CLOSURE %d %s:%s %s ENV=%s",
-                            closureCount, source, line, name, envPath)
-                        append("FUNCTIONS", label .. "\n")
-                        if type(constantsFn) == "function" then
-                            local constantsOk, constants = pcall(constantsFn, fn)
-                            if constantsOk and type(constants) == "table" then
-                                for key, constant in pairs(constants) do
-                                    local value = type(constant) == "string"
-                                        and string.format("%q", constant) or tostring(constant)
-                                    append("FUNCTIONS", string.format("  CONST %s = %s\n", tostring(key), value))
-                                    if type(constant) == "string" then
-                                        scan(label .. " CONST " .. tostring(key), constant)
-                                    end
-                                end
-                            end
-                        end
-                        if type(upvaluesFn) == "function" then
-                            local upOk, upvalues = pcall(upvaluesFn, fn)
-                            if upOk and type(upvalues) == "table" then
-                                for key, value in pairs(upvalues) do
-                                    append("FUNCTIONS", string.format("  UPVALUE %s : %s\n",
-                                        tostring(key), typeof(value)))
-                                end
-                            end
-                        end
-                        if closureCount % 5 == 0 then
-                            setFarmStatus(string.format("Full dump: functions %d", closureCount))
-                            task.wait(0.03)
-                        end
-                    end
-                end
-            else
-                table.insert(errors, "getgc: " .. tostring(objects))
-            end
-        end
-
-        for section in pairs(sections) do
-            flush(section)
-        end
-        table.sort(files)
-        table.insert(index, string.format("Scripts decompiled: %d", decompiledCount))
-        table.insert(index, string.format("Bytecode fallbacks: %d", bytecodeCount))
-        table.insert(index, string.format("Runtime functions indexed: %d", closureCount))
-        table.insert(index, string.format("Reference hits: %d", referenceCount))
-        table.insert(index, "Stopped early: " .. tostring(stopRequested()))
-        table.insert(index, "\nFILES")
-        for _, path in ipairs(files) do
-            table.insert(index, path)
-        end
-        table.insert(index, "\nERRORS")
-        for _, err in ipairs(errors) do
-            table.insert(index, err)
-        end
-        local indexPath = prefix .. "_INDEX.txt"
-        writefile(indexPath, table.concat(index, "\n"))
-        return {
-            Summary = string.format("%s (%d scripts, %d functions, %d references, %d file errors%s)",
-                indexPath, #scripts, closureCount, referenceCount, writeFailures,
-                stopRequested() and ", stopped early" or ""),
-            WriteFailures = writeFailures,
-        }
-    end)
-    Farm.FullDumpRunning = false
-    Farm.FullDumpStop = false
-    if not ok then
-        setFarmStatus("Full client dump failed: " .. tostring(result))
-        return false, tostring(result)
-    end
-    setFarmStatus(result.WriteFailures == 0 and "Full client dump saved: " .. result.Summary
-        or "Full client dump has file errors: " .. result.Summary)
-    return result.WriteFailures == 0, result.Summary
-end
-
-function Farm.captureEggReturnTrace()
-    if type(writefile) ~= "function" then
-        return false, "Executor file writing is unavailable"
-    end
-    if Farm.EggTraceRunning then
-        return false, "Egg return trace is already running"
-    end
-    Farm.EggTraceRunning = true
-    local connections, lines = {}, { "Crystal Hub egg return event trace" }
-    local started = os.clock()
-    local outputPath = "CrystalHub_EggReturn_trace_" .. os.date("!%Y%m%d_%H%M%S") .. ".txt"
-
-    local function valueText(value)
-        if typeof(value) == "Instance" then
-            local ok, path = pcall(function() return value:GetFullName() end)
-            return ok and path or tostring(value)
-        elseif typeof(value) == "Vector3" then
-            return string.format("Vector3(%.2f, %.2f, %.2f)", value.X, value.Y, value.Z)
-        elseif typeof(value) == "CFrame" then
-            return "CFrame(" .. tostring(value.Position) .. ")"
-        end
-        return tostring(value)
-    end
-
-    local function record(label, ...)
-        local root = getRoot()
-        local data = {}
-        for i = 1, select("#", ...) do
-            table.insert(data, valueText(select(i, ...)))
-        end
-        table.insert(lines, string.format("+%.3fs | %s | args=[%s] | root=%s | basket=%d",
-            os.clock() - started, label, table.concat(data, ", "),
-            root and valueText(root.Position) or "nil", getBasketCount()))
-    end
-
-    local ok, err = pcall(function()
-        local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-        if remotes then
-            for _, item in ipairs(remotes:GetDescendants()) do
-                if item:IsA("RemoteEvent") then
-                    local path = string.lower(item:GetFullName())
-                    if string.find(path, "egg", 1, true)
-                        or string.find(path, "basket", 1, true)
-                        or string.find(path, "warning", 1, true)
-                        or string.find(path, "message", 1, true) then
-                        table.insert(connections, item.OnClientEvent:Connect(function(...)
-                            record("OnClientEvent " .. item:GetFullName(), ...)
-                        end))
-                    end
-                end
-            end
-        end
-        for _, item in ipairs(PlayerGui:GetDescendants()) do
-            if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
-                local path = string.lower(item:GetFullName())
-                if string.find(path, "egg", 1, true)
-                    or string.find(path, "warning", 1, true)
-                    or string.find(path, "message", 1, true) then
-                    table.insert(connections, item:GetPropertyChangedSignal("Text"):Connect(function()
-                        record("UI.Text " .. item:GetFullName(), item.Text)
-                    end))
-                end
-            end
-        end
-        local basket = LocalPlayer:FindFirstChild("Basket")
-        if basket then
-            table.insert(connections, basket.ChildAdded:Connect(function(item)
-                record("Basket.ChildAdded", item.Name, item:GetAttribute("Egg"),
-                    item:GetAttribute("BreakAt"))
-            end))
-            table.insert(connections, basket.ChildRemoved:Connect(function(item)
-                record("Basket.ChildRemoved", item.Name, item:GetAttribute("Egg"))
-            end))
-        end
-        record("TRACE START")
-        local deadline = os.clock() + 60
-        while Farm.Alive and os.clock() < deadline do
-            task.wait(0.5)
-        end
-        record("TRACE END")
-    end)
-    for _, connection in ipairs(connections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    Farm.EggTraceRunning = false
-    if not ok then
-        table.insert(lines, "TRACE ERROR " .. tostring(err))
-    end
-    local saved, saveErr = pcall(writefile, outputPath, table.concat(lines, "\n"))
-    if not saved then
-        return false, tostring(saveErr)
-    end
-    return ok, outputPath
-end
-
 local function interactWithTarget(target, holdTime)
     if not target or not target.Parent then
         return false
@@ -9274,7 +8833,7 @@ Farm.Chilli = {
     Manual = {}, Carried = {}, RejectedUntil = {}, Target = nil,
     Dropped = nil, LastPickupAt = 0, PickupPos = nil, Relaying = false,
     MinRank = 0, Priority = "Highest Rarity", ReserveSeconds = 3,
-    UseRelay = false, ReturnedCount = 0, DepositedCount = 0,
+    UseRelay = false, DepositedCount = 0,
 }
 
 -- RideAPet-style character pivot, with server-confirmed pickup and arrival
@@ -9654,7 +9213,6 @@ function Farm.chilliDeliver(shouldStop)
         setFarmStatus("Delivery: own Baseplate not found")
         return false
     end
-    local returnsBefore = Farm.Chilli.ReturnedCount
     local depositsBefore = Farm.Chilli.DepositedCount
     local basket = LocalPlayer:FindFirstChild("Basket")
     local names = {}
@@ -9673,15 +9231,14 @@ function Farm.chilliDeliver(shouldStop)
     -- The game client may claim arrival on its own. Re-send the same claim
     -- after the pivot so the server can use its updated character position.
     for attempt = 1, 8 do
-        if getBasketCount() == 0 or Farm.Chilli.ReturnedCount > returnsBefore
-            or (shouldStop and shouldStop()) then
+        if getBasketCount() == 0 or (shouldStop and shouldStop()) then
             break
         end
         local root = getRoot()
         if not root then break end
         fireGameRemote("EggArrivalClaim", Workspace:GetServerTimeNow(), root.Position, names)
         for _ = 1, 8 do
-            if getBasketCount() == 0 or Farm.Chilli.ReturnedCount > returnsBefore then
+            if getBasketCount() == 0 then
                 break
             end
             task.wait(0.02)
@@ -9691,7 +9248,6 @@ function Farm.chilliDeliver(shouldStop)
     if getBasketCount() == 0 then
         local confirmationDeadline = os.clock() + 1
         while Farm.Chilli.DepositedCount == depositsBefore
-            and Farm.Chilli.ReturnedCount == returnsBefore
             and os.clock() < confirmationDeadline do
             RunService.Heartbeat:Wait()
         end
@@ -9699,11 +9255,8 @@ function Farm.chilliDeliver(shouldStop)
         Farm.Chilli.PickupPos = nil
     end
     local deposited = getBasketCount() == 0 and Farm.Chilli.DepositedCount > depositsBefore
-        and Farm.Chilli.ReturnedCount == returnsBefore
     if deposited then
         setFarmStatus("RideAPet delivery confirmed")
-    elseif Farm.Chilli.ReturnedCount > returnsBefore then
-        setFarmStatus("Server returned egg; delivery stopped")
     else
         setFarmStatus("Arrival claim sent; deposit not confirmed")
     end
@@ -9852,7 +9405,6 @@ end)
 
 function Library:StopFeatures()
     Farm.Enabled = false
-    Farm.FullDumpStop = true
     Farm.TeleportFarmEnabled = false
     Farm.TeleportRejectedUntil = 0
     Farm.AutoPlaceEnabled = false
@@ -10016,8 +9568,6 @@ function Farm.buildInterface()
     UI.StatusLabel = infoSection:AddLabel("Status: " .. Farm.Status)
     UI.SelectedLabel = infoSection:AddLabel("Selected eggs: All")
     UI.SpawnedCountLabel = infoSection:AddLabel("Spawned eggs detected: 0")
-    infoSection:AddLabel("Anti-AFK: enabled")
-    infoSection:AddLabel("RideAPet instant collect uses ActiveEggs. No selected egg types means all types.")
 
     local farmSection = mainTab:AddSection("Auto Farm")
     UI.AutoFarmToggle = farmSection:AddToggle("Enable Auto Farm", false, function(enabled)
@@ -10032,23 +9582,6 @@ function Farm.buildInterface()
         })
     end, "farm_enabled")
 
-    local remotesRoot = ReplicatedStorage:FindFirstChild("Remotes")
-    local reusableRemotes = remotesRoot and remotesRoot:FindFirstChild("Reusable")
-    local gameMessage = reusableRemotes and reusableRemotes:FindFirstChild("GameMessage")
-    if gameMessage and gameMessage:IsA("RemoteEvent") then
-        trackFarmConnection(gameMessage.OnClientEvent:Connect(function(message)
-            if Farm.Enabled and type(message) == "string"
-                and string.find(lowerText(message), "egg was returned", 1, true) then
-                Farm.Chilli.ReturnedCount += 1
-                if UI.AutoFarmToggle then
-                    UI.AutoFarmToggle:Set(false)
-                else
-                    Farm.setAutoFarm(false)
-                end
-                setFarmStatus("Server returned egg; Auto Farm paused")
-            end
-        end))
-    end
     local eggPickupFeedback = getGameRemote("EggPickup")
     if eggPickupFeedback then
         trackFarmConnection(eggPickupFeedback.OnClientEvent:Connect(function(result)
@@ -10070,47 +9603,6 @@ function Farm.buildInterface()
         "Highest Rarity", function(value)
             Farm.Chilli.Priority = tostring(value)
         end, "farm_chilli_priority")
-    farmSection:AddLabel("Instant method: pivot to egg, retry EggPickup, pivot to Baseplate, claim arrival.")
-
-    farmSection:AddButton("Dump Egg Return / AC (Low Lag)", function()
-        task.spawn(function()
-            local ok, result = dumpClientAntiCheatCandidates(false)
-            Window:Notify({
-                Title = "Crystal Hub",
-                Text = ok and ("Focused dump saved: " .. result) or ("Focused dump: " .. result),
-                Duration = 8,
-                Kind = ok and "success" or "warning",
-            })
-        end)
-    end, "farm_dump_egg_focus")
-    farmSection:AddButton("Full Client Dump (Slow)", function()
-        task.spawn(function()
-            local ok, result = dumpClientAntiCheatCandidates(true)
-            Window:Notify({
-                Title = "Crystal Hub",
-                Text = ok and ("Full dump saved: " .. result) or ("Full dump: " .. result),
-                Duration = 8,
-                Kind = ok and "success" or "warning",
-            })
-        end)
-    end, "farm_dump_full_client_slow")
-    farmSection:AddButton("Stop Dump", function()
-        Farm.FullDumpStop = true
-        setFarmStatus("Stopping dump after current script")
-    end, "farm_dump_stop")
-    farmSection:AddLabel("Dump files are written to the executor workspace; open the _INDEX.txt file first.")
-    farmSection:AddButton("Record Egg Return Events (60s)", function()
-        task.spawn(function()
-            local ok, result = Farm.captureEggReturnTrace()
-            Window:Notify({
-                Title = "Crystal Hub",
-                Text = ok and ("Egg return trace saved: " .. result)
-                    or ("Egg return trace: " .. result),
-                Duration = 8,
-                Kind = ok and "success" or "warning",
-            })
-        end)
-    end, "farm_trace_egg_return")
 
     farmSection:AddButton("Return to My Plot", function()
         local previous = Farm.Enabled
@@ -10203,10 +9695,6 @@ function Farm.buildInterface()
         end
     end, "ranch_feed_foods")
 
-    ranchSection:AddLabel("Place Best is reproduced directly from the game's PickupPet / PlacePet remotes.")
-    ranchSection:AddLabel("Auto Place equips one egg and sends the exact EggPlaced payload captured from manual placement.")
-    ranchSection:AddLabel("Plot limit: 10 active eggs. Full plots wait for Ready -> Hatch -> plant next.")
-    ranchSection:AddLabel("Auto Feed uses the cheapest available selected food; empty selection uses any food.")
 
     local shopSection = autoTab:AddSection("Auto Shop")
     UI.ShopStatusLabel = shopSection:AddLabel("Shop: " .. Commerce.Status)
